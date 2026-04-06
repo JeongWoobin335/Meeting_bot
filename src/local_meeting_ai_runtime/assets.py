@@ -157,6 +157,13 @@ def prepare_whisper_cpp_assets(
     else:
         destination = resolved_asset_root / "bin" / cli_source.name
         _copy_asset(cli_source, destination, overwrite=overwrite, copied=copied, existing=existing)
+        _copy_whisper_cpp_runtime_sidecars(
+            cli_source=cli_source,
+            destination_dir=resolved_asset_root / "bin",
+            overwrite=overwrite,
+            copied=copied,
+            existing=existing,
+        )
 
     if model_source is None:
         missing.append(f"model:{normalized_model_name}")
@@ -271,6 +278,43 @@ def _copy_asset(
         return
     shutil.copy2(source, destination)
     copied.append({"source": str(source), "destination": str(destination)})
+
+
+def _copy_whisper_cpp_runtime_sidecars(
+    *,
+    cli_source: Path,
+    destination_dir: Path,
+    overwrite: bool,
+    copied: list[dict[str, str]],
+    existing: list[dict[str, str]],
+) -> None:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for source in _whisper_cpp_runtime_sidecars(cli_source):
+        destination = destination_dir / source.name
+        _copy_asset(source, destination, overwrite=overwrite, copied=copied, existing=existing)
+
+
+def _whisper_cpp_runtime_sidecars(cli_source: Path) -> list[Path]:
+    source_dir = cli_source.parent
+    if sys.platform.startswith("win"):
+        patterns = ("*.dll",)
+    elif sys.platform == "darwin":
+        patterns = ("*.dylib", "*.so", "*.so.*")
+    else:
+        patterns = ("*.so", "*.so.*")
+
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for candidate in source_dir.glob(pattern):
+            resolved = candidate.resolve()
+            key = str(resolved).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(resolved)
+    matches.sort(key=lambda path: path.name.lower())
+    return matches
 
 
 def _path_under_root(path: Path | None, root: Path) -> bool:

@@ -417,12 +417,6 @@ def _prepare_whisper_cpp_assets_from_system_install(
     copied_count = 0
     existing_count = 0
 
-    cli_destination = resolved_asset_root / "bin" / system_cli.name
-    if _copy_optional_asset(system_cli, cli_destination, executable=True):
-        copied_count += 1
-    else:
-        existing_count += 1
-
     model_destination = resolved_asset_root / "models" / model_source.name
     if _copy_optional_asset(model_source, model_destination):
         copied_count += 1
@@ -437,21 +431,18 @@ def _prepare_whisper_cpp_assets_from_system_install(
         else:
             existing_count += 1
 
-    status = whisper_cpp_asset_status(model_name=model_name)
-    if not bool(status.get("ready")):
-        return None
-
+    resolved_model = model_destination if model_destination.exists() else model_source
     return {
         "step": "whisper_cpp_assets",
         "status": "ok",
         "model_name": model_name,
-        "asset_root": status.get("asset_root"),
+        "asset_root": str(resolved_asset_root),
         "copied_count": copied_count,
         "existing_count": existing_count,
-        "external_asset_root_ready": bool(status.get("external_asset_root_ready")),
-        "whisper_cli_path": status.get("whisper_cli_path"),
-        "model_path": status.get("model_path"),
-        "detail": "Prepared whisper.cpp runtime assets from a system Homebrew install.",
+        "external_asset_root_ready": False,
+        "whisper_cli_path": str(system_cli),
+        "model_path": str(resolved_model),
+        "detail": "Using the system whisper-cli install and the prepared local model asset.",
     }
 
 

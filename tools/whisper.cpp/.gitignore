@@ -17,6 +17,14 @@ build-*/
 build_*/
 tmp/
 
+!build/bin/
+!build/bin/Release/
+!build/bin/Release/whisper-cli.exe
+!build/bin/Release/whisper.dll
+!build/bin/Release/ggml.dll
+!build/bin/Release/ggml-base.dll
+!build/bin/Release/ggml-cpu.dll
+
 # SPM
 .build/
 .swiftpm
