@@ -8,6 +8,7 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 from .models import DelegateSession, RunnerJob, session_from_dict, utcnow_iso
 
@@ -89,7 +90,7 @@ def _decode_json_payload(raw_text: str) -> dict[str, dict]:
         return merged
 
 
-def _write_json_atomic(path: Path, payload: dict[str, dict]) -> None:
+def _write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     fd, temp_path = tempfile.mkstemp(
@@ -111,40 +112,59 @@ def _write_json_atomic(path: Path, payload: dict[str, dict]) -> None:
 
 class SessionStore:
     def __init__(self, path: str = "data/delegate_sessions.json") -> None:
-        self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._legacy_path = Path(path)
+        self._legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        self._session_dir = self._legacy_path.with_name(f"{self._legacy_path.stem}.d")
+        self._session_dir.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
-        self._file_lock = _InterProcessFileLock(self._path.with_suffix(f"{self._path.suffix}.lock"))
 
-    def _load_raw(self) -> dict[str, dict]:
-        if not self._path.exists():
+    def _session_path(self, session_id: str) -> Path:
+        return self._session_dir / f"{session_id}.json"
+
+    def _session_lock_path(self, session_id: str) -> Path:
+        return self._session_dir / f"{session_id}.json.lock"
+
+    def _load_legacy_raw(self) -> dict[str, dict]:
+        if not self._legacy_path.exists():
             return {}
-        return _decode_json_payload(self._path.read_text(encoding="utf-8"))
+        return _decode_json_payload(self._legacy_path.read_text(encoding="utf-8"))
 
-    def _save_raw(self, payload: dict[str, dict]) -> None:
-        _write_json_atomic(self._path, payload)
+    def _load_session_raw(self, session_id: str) -> dict[str, Any] | None:
+        path = self._session_path(session_id)
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Session payload at {path} must be a JSON object.")
+        return payload
 
     def list_sessions(self) -> list[DelegateSession]:
         with self._lock:
-            with self._file_lock:
-                payload = self._load_raw()
+            payload = self._load_legacy_raw()
+            for path in sorted(self._session_dir.glob("*.json")):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                session_id = str(raw.get("session_id") or path.stem).strip() or path.stem
+                payload[session_id] = raw
         return [session_from_dict(item) for item in payload.values()]
 
     def get_session(self, session_id: str) -> DelegateSession | None:
         with self._lock:
-            with self._file_lock:
-                payload = self._load_raw()
-        raw = payload.get(session_id)
+            raw = self._load_session_raw(session_id)
+            if raw is None:
+                raw = self._load_legacy_raw().get(session_id)
         if raw is None:
             return None
         return session_from_dict(raw)
 
     def save_session(self, session: DelegateSession) -> DelegateSession:
         with self._lock:
-            with self._file_lock:
-                payload = self._load_raw()
-                payload[session.session_id] = session.to_dict()
-                self._save_raw(payload)
+            with _InterProcessFileLock(self._session_lock_path(session.session_id)):
+                _write_json_atomic(self._session_path(session.session_id), session.to_dict())
         return session
 
     def mutate_session(
@@ -153,16 +173,16 @@ class SessionStore:
         mutator,
     ) -> DelegateSession | None:
         with self._lock:
-            with self._file_lock:
-                payload = self._load_raw()
-                raw = payload.get(session_id)
+            with _InterProcessFileLock(self._session_lock_path(session_id)):
+                raw = self._load_session_raw(session_id)
+                if raw is None:
+                    raw = self._load_legacy_raw().get(session_id)
                 if raw is None:
                     return None
                 session = session_from_dict(raw)
                 mutator(session)
                 session.touch()
-                payload[session.session_id] = session.to_dict()
-                self._save_raw(payload)
+                _write_json_atomic(self._session_path(session.session_id), session.to_dict())
         return session
 
 

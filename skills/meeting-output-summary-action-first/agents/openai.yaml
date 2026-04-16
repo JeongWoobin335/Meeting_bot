@@ -1,0 +1,4 @@
+interface:
+  display_name: "Summary + Action First"
+  short_description: "Reusable override that emphasizes the overall summary and moves action items above decisions."
+  default_prompt: "Use the summary-action-first meeting output skill when the overall summary should be the most prominent block, open questions can be omitted, and action items should appear before decisions."

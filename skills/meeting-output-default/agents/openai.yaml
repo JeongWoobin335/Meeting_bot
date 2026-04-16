@@ -1,0 +1,4 @@
+interface:
+  display_name: "Meeting Output Default"
+  short_description: "Default meeting note style for Zoom Meeting Bot outputs."
+  default_prompt: "Use the default meeting output skill for structured Korean meeting notes."

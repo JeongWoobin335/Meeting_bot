@@ -22,6 +22,15 @@
     "whisper_cpp_command": "tools/whisper.cpp/build/bin/Release/whisper-cli.exe",
     "whisper_cpp_model": "tools/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin"
   },
+  "skills": {
+    "meeting_output_path": "skills/meeting-output-default/SKILL.md",
+    "meeting_output_override_path": "",
+    "meeting_output_customization": "",
+    "generated_meeting_output_dir": "skills/generated"
+  },
+  "meeting_artifacts": {
+    "pdf_renderer": "docx"
+  },
   "telegram": {
     "enabled": true,
     "bot_name": "MyTelegramBot",

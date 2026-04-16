@@ -40,6 +40,21 @@ from .runtime_manager import (
     start_runtime,
     stop_runtime,
 )
+from .skill_manager import (
+    activate_meeting_output_override,
+    append_skill_compose_message,
+    build_interactive_skill_target_path,
+    build_session_skill_refinement_prompt,
+    clear_meeting_output_override,
+    describe_skill_state,
+    finalize_composed_skill,
+    list_generated_skill_assets,
+    prepare_skill_compose_workspace,
+    resolve_codex_command,
+    resolve_skill_asset_selection,
+    run_skill_compose_turn,
+    write_skill_compose_user_message,
+)
 from .runtime_env import package_root, resolve_workspace_path, runtime_host, runtime_port, runtime_state_path
 from .model_manager import prepare_models
 from .package_manager import build_distribution_bundle
@@ -330,6 +345,109 @@ def build_parser() -> argparse.ArgumentParser:
     )
     open_session_parser.set_defaults(func=handle_open_session)
 
+    skill_parser = subparsers.add_parser(
+        "skill",
+        help="Compose or manage reusable meeting-output skills.",
+    )
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
+
+    skill_compose_parser = skill_subparsers.add_parser(
+        "compose",
+        help="Open a conversational skill-authoring flow for meeting-output customization.",
+    )
+    skill_compose_parser.add_argument(
+        "--name",
+        default="",
+        help="Optional label used in the generated skill folder name.",
+    )
+    skill_compose_parser.add_argument(
+        "--prompt",
+        default="",
+        help="Optional first request to seed the skill-authoring conversation.",
+    )
+    skill_compose_parser.add_argument(
+        "--fallback-only",
+        action="store_true",
+        help="Do not launch Codex even if it is installed; save the request as a deferred customization instead.",
+    )
+    skill_compose_parser.add_argument(
+        "--no-activate",
+        action="store_true",
+        help="Create the generated skill file but do not connect it to the active config automatically.",
+    )
+    skill_compose_parser.set_defaults(func=handle_skill_compose)
+
+    skill_refine_parser = skill_subparsers.add_parser(
+        "refine",
+        help="Turn feedback on a completed meeting result into a reusable meeting-output skill.",
+    )
+    skill_refine_parser.add_argument(
+        "--session-id",
+        required=True,
+        help="Completed delegate session ID to use as result context.",
+    )
+    skill_refine_parser.add_argument(
+        "--prompt",
+        default="",
+        help="Feedback such as '이번 결과물은 너무 딱딱했어. 다음엔 액션 아이템을 맨 위에 둬줘.'",
+    )
+    skill_refine_parser.add_argument(
+        "--name",
+        default="",
+        help="Optional label used in the generated skill folder name.",
+    )
+    skill_refine_parser.add_argument(
+        "--fallback-only",
+        action="store_true",
+        help="Do not launch Codex even if it is installed; save the refinement request as a deferred customization instead.",
+    )
+    skill_refine_parser.add_argument(
+        "--no-activate",
+        action="store_true",
+        help="Create the refined skill file but do not connect it to the active config automatically.",
+    )
+    skill_refine_parser.set_defaults(func=handle_skill_refine)
+
+    skill_status_parser = skill_subparsers.add_parser(
+        "status",
+        help="Show the current base skill, override skill, and deferred customization state.",
+    )
+    skill_status_parser.set_defaults(func=handle_skill_status)
+
+    skill_list_parser = skill_subparsers.add_parser(
+        "list",
+        help="List generated skill assets that can be activated.",
+    )
+    skill_list_parser.set_defaults(func=handle_skill_list)
+
+    skill_activate_parser = skill_subparsers.add_parser(
+        "activate",
+        help="Activate one saved generated skill without editing config keys manually.",
+    )
+    skill_activate_parser.add_argument(
+        "selector",
+        nargs="?",
+        default="",
+        help="Optional skill index, skill name, folder name, or relative path from `skill list`.",
+    )
+    skill_activate_parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Activate the most recently generated skill.",
+    )
+    skill_activate_parser.set_defaults(func=handle_skill_activate)
+
+    skill_clear_parser = skill_subparsers.add_parser(
+        "clear",
+        help="Clear the active override skill from the current config.",
+    )
+    skill_clear_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also clear any deferred natural-language customization request.",
+    )
+    skill_clear_parser.set_defaults(func=handle_skill_clear)
+
     return parser
 
 
@@ -359,6 +477,324 @@ def handle_configure(args: argparse.Namespace) -> int:
     updated = _collect_interactive_config(config)
     write_config(config_path, updated)
     print(f"Updated config: {config_path}")
+    return 0
+
+
+def handle_skill_compose(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    config = _load_effective_config(config_path)
+    skill_state = describe_skill_state(config)
+    codex_command = "" if bool(args.fallback_only) else resolve_codex_command(config)
+    initial_request = str(args.prompt or "").strip()
+
+    print("Result-generation skill compose")
+    print("원하는 회의 결과물 생성 방식을 자연어로 말씀해 주세요.")
+    print("빈 줄 또는 /done 으로 마치고, /cancel 이면 저장 없이 종료합니다.")
+
+    if not initial_request:
+        initial_request = _prompt_required("첫 요청", "")
+    if initial_request.strip() == "/cancel":
+        print("취소했습니다.")
+        return 0
+
+    if codex_command:
+        target_path = build_interactive_skill_target_path(config, label=str(args.name or "").strip())
+        compose_workspace = prepare_skill_compose_workspace(
+            base_skill_path=Path(skill_state["base_skill_path"]),
+            final_output_path=target_path,
+        )
+        pending_request = initial_request
+        exit_code = 0
+        while True:
+            write_skill_compose_user_message(
+                workspace_dir=Path(compose_workspace["sandbox_dir"]),
+                text=pending_request,
+            )
+            append_skill_compose_message(
+                workspace_dir=Path(compose_workspace["sandbox_dir"]),
+                role="User",
+                text=pending_request,
+            )
+            print()
+            print("Assistant is drafting the skill...")
+            turn_result = run_skill_compose_turn(
+                codex_command=codex_command,
+                workspace_dir=Path(compose_workspace["sandbox_dir"]),
+            )
+            exit_code = int(turn_result["exit_code"])
+            assistant_reply = str(turn_result["assistant_reply"] or "").strip()
+            if assistant_reply:
+                append_skill_compose_message(
+                    workspace_dir=Path(compose_workspace["sandbox_dir"]),
+                    role="Assistant",
+                    text=assistant_reply,
+                )
+                print()
+                print(f"Assistant: {assistant_reply}")
+            if exit_code != 0:
+                print()
+                print("Skill compose assistant could not finish this turn cleanly.")
+                return 1
+            next_request = input("\nYou: ").strip()
+            if not next_request or next_request == "/done":
+                break
+            if next_request == "/cancel":
+                print("취소했습니다. 새 skill은 저장하지 않았습니다.")
+                return 0
+            pending_request = next_request
+        finalized_skill_path = finalize_composed_skill(
+            sandbox_skill_path=Path(compose_workspace["sandbox_skill_path"]),
+            final_output_path=target_path,
+        )
+        if not finalized_skill_path:
+            print("완성된 skill 초안을 찾지 못해서 저장하지 않았습니다.")
+            return 1 if exit_code != 0 else 0
+        print()
+        print(f"새 skill을 저장했습니다: {finalized_skill_path}")
+        if bool(args.no_activate):
+            print("활성화는 건너뛰었습니다.")
+            return 0
+        should_activate = _prompt_bool("이 skill을 앞으로 회의 결과물에 바로 적용할까요", True)
+        if should_activate:
+            activate_meeting_output_override(
+                config=config,
+                config_path=config_path,
+                skill_path=Path(finalized_skill_path),
+                clear_customization=True,
+            )
+            print("새 skill을 활성화했습니다.")
+        else:
+            print("skill 파일은 남겨두고, 설정은 바꾸지 않았습니다.")
+        return 0
+
+    print("Codex를 찾지 못해서 자연어 요청만 저장해 두겠습니다.")
+    updated = dict(config)
+    skills = dict(updated.get("skills") or {})
+    skills["meeting_output_customization"] = initial_request
+    skills["meeting_output_override_path"] = ""
+    updated["skills"] = skills
+    write_config(config_path, updated)
+    print("나중에 재사용할 수 있도록 요청을 저장했습니다.")
+    return 0
+
+
+def _run_skill_compose_flow(
+    *,
+    config: dict[str, Any],
+    config_path: Path,
+    codex_command: str,
+    base_skill_path: Path,
+    target_path: Path,
+    initial_request: str,
+    no_activate: bool,
+) -> int:
+    compose_workspace = prepare_skill_compose_workspace(
+        base_skill_path=base_skill_path,
+        final_output_path=target_path,
+    )
+    pending_request = initial_request
+    exit_code = 0
+    while True:
+        write_skill_compose_user_message(
+            workspace_dir=Path(compose_workspace["sandbox_dir"]),
+            text=pending_request,
+        )
+        append_skill_compose_message(
+            workspace_dir=Path(compose_workspace["sandbox_dir"]),
+            role="User",
+            text=pending_request,
+        )
+        print()
+        print("Assistant is drafting the skill...")
+        turn_result = run_skill_compose_turn(
+            codex_command=codex_command,
+            workspace_dir=Path(compose_workspace["sandbox_dir"]),
+        )
+        exit_code = int(turn_result["exit_code"])
+        assistant_reply = str(turn_result["assistant_reply"] or "").strip()
+        if assistant_reply:
+            append_skill_compose_message(
+                workspace_dir=Path(compose_workspace["sandbox_dir"]),
+                role="Assistant",
+                text=assistant_reply,
+            )
+            print()
+            print(f"Assistant: {assistant_reply}")
+        if exit_code != 0:
+            print()
+            print("Skill compose assistant could not finish this turn cleanly.")
+            return 1
+        next_request = input("\nYou: ").strip()
+        if not next_request or next_request == "/done":
+            break
+        if next_request == "/cancel":
+            print("취소했습니다. 새 skill은 저장하지 않았습니다.")
+            return 0
+        pending_request = next_request
+    finalized_skill_path = finalize_composed_skill(
+        sandbox_skill_path=Path(compose_workspace["sandbox_skill_path"]),
+        final_output_path=target_path,
+    )
+    if not finalized_skill_path:
+        print("완성된 skill 초안을 찾지 못해서 저장하지 않았습니다.")
+        return 1 if exit_code != 0 else 0
+    print()
+    print(f"새 skill을 저장했습니다: {finalized_skill_path}")
+    if no_activate:
+        print("활성화는 건너뛰었습니다.")
+        return 0
+    should_activate = _prompt_bool("이 skill을 앞으로 회의 결과물에 바로 적용할까요", True)
+    if should_activate:
+        activate_meeting_output_override(
+            config=config,
+            config_path=config_path,
+            skill_path=Path(finalized_skill_path),
+            clear_customization=True,
+        )
+        print("새 skill을 활성화했습니다.")
+    else:
+        print("skill 파일은 남겨두고, 설정은 바꾸지 않았습니다.")
+    return 0
+
+
+def handle_skill_refine(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    config = _load_effective_config(config_path)
+    skill_state = describe_skill_state(config)
+    codex_command = "" if bool(args.fallback_only) else resolve_codex_command(config)
+    feedback = str(args.prompt or "").strip()
+
+    print("Result-generation skill refine")
+    print("이미 나온 회의 결과물을 본 뒤, 다음 결과물 생성 방식으로 쌓을 피드백을 말씀해 주세요.")
+    if not feedback:
+        feedback = _prompt_required("피드백", "")
+    if feedback.strip() == "/cancel":
+        print("취소했습니다.")
+        return 0
+
+    initial_request = build_session_skill_refinement_prompt(
+        config=config,
+        session_id=str(args.session_id or "").strip(),
+        user_feedback=feedback,
+    )
+    base_skill_path = (
+        Path(skill_state["override_skill_path"])
+        if str(skill_state["override_skill_path"] or "").strip()
+        else Path(skill_state["base_skill_path"])
+    )
+
+    if codex_command:
+        target_path = build_interactive_skill_target_path(
+            config,
+            label=str(args.name or "").strip() or f"refine-{str(args.session_id or '').strip()}",
+        )
+        return _run_skill_compose_flow(
+            config=config,
+            config_path=config_path,
+            codex_command=codex_command,
+            base_skill_path=base_skill_path,
+            target_path=target_path,
+            initial_request=initial_request,
+            no_activate=bool(args.no_activate),
+        )
+
+    print("Codex를 찾지 못해서 refinement 요청만 저장해 두겠습니다.")
+    updated = dict(config)
+    skills = dict(updated.get("skills") or {})
+    skills["meeting_output_customization"] = initial_request
+    skills["meeting_output_override_path"] = ""
+    updated["skills"] = skills
+    write_config(config_path, updated)
+    print("나중에 재사용할 수 있도록 요청을 저장했습니다.")
+    return 0
+
+
+def handle_skill_status(args: argparse.Namespace) -> int:
+    config = _load_effective_config(args.config)
+    state = describe_skill_state(config)
+    codex_command = resolve_codex_command(config)
+    print("Meeting-output skill status")
+    print("--------------------------")
+    print(f"- base skill: {state['base_skill_path']}")
+    print(f"- active override: {state['override_skill_path'] or '(none)'}")
+    print(f"- generated skill dir: {state['generated_skill_dir']}")
+    print(f"- deferred customization: {state['customization_request'] or '(none)'}")
+    print(f"- codex command: {codex_command or '(not found)'}")
+    return 0
+
+
+def handle_skill_list(args: argparse.Namespace) -> int:
+    config = _load_effective_config(args.config)
+    state = describe_skill_state(config)
+    assets = list_generated_skill_assets(config)
+    print("Generated skill assets")
+    print("----------------------")
+    print(f"- generated skill dir: {state['generated_skill_dir']}")
+    print(f"- active override: {state['override_skill_path'] or '(none)'}")
+    if not assets:
+        print("- 아직 생성된 skill 자산이 없습니다.")
+        return 0
+    for asset in assets:
+        active_marker = " [active]" if asset.is_active else ""
+        print(f"{asset.index}. {asset.name}{active_marker}")
+        print(f"   - folder: {asset.folder_name}")
+        if asset.description:
+            print(f"   - description: {asset.description}")
+        print(f"   - path: {asset.relative_path}")
+    return 0
+
+
+def handle_skill_activate(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    config = _load_effective_config(config_path)
+    assets = list_generated_skill_assets(config)
+    if not assets:
+        print("활성화할 generated skill 자산이 아직 없습니다.")
+        return 1
+
+    selected = None
+    if bool(args.latest):
+        selected = assets[0]
+    elif str(args.selector or "").strip():
+        selected = resolve_skill_asset_selection(assets, str(args.selector or "").strip())
+        if selected is None:
+            print("해당 selector로는 skill을 찾지 못했습니다.")
+            print("`skill list`로 번호와 이름을 먼저 확인해 주세요.")
+            return 1
+    else:
+        print("활성화할 skill을 골라 주세요.")
+        for asset in assets:
+            active_marker = " [active]" if asset.is_active else ""
+            print(f"  [{asset.index}] {asset.name}{active_marker}")
+        choice = _prompt_required("번호", "")
+        selected = resolve_skill_asset_selection(assets, choice)
+        if selected is None:
+            print("올바른 번호를 고르지 못해서 종료했습니다.")
+            return 1
+
+    activate_meeting_output_override(
+        config=config,
+        config_path=config_path,
+        skill_path=selected.path,
+        clear_customization=True,
+    )
+    print(f"활성화했습니다: {selected.name}")
+    print(f"- path: {selected.relative_path}")
+    return 0
+
+
+def handle_skill_clear(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    config = _load_effective_config(config_path)
+    clear_meeting_output_override(
+        config=config,
+        config_path=config_path,
+        clear_customization=bool(args.all),
+    )
+    if bool(args.all):
+        print("Cleared the active override skill and deferred customization request.")
+    else:
+        print("Cleared the active override skill.")
     return 0
 
 
@@ -445,6 +881,7 @@ def handle_show_config(args: argparse.Namespace) -> int:
         return 0
 
     profile = dict(config.get("profile") or {})
+    skills = dict(config.get("skills") or {})
     telegram = dict(config.get("telegram") or {})
     print("설정 요약")
     print("---------")
@@ -920,12 +1357,25 @@ def _resolved_paths(config: dict[str, Any]) -> dict[str, str]:
     runtime = dict(config.get("runtime") or {})
     launcher = dict(config.get("launcher") or {})
     local_ai = dict(config.get("local_ai") or {})
+    skills = dict(config.get("skills") or {})
     whisper_cpp_command = str(local_ai.get("whisper_cpp_command") or "").strip()
     whisper_cpp_model = str(local_ai.get("whisper_cpp_model") or "").strip()
+    meeting_output_skill = str(skills.get("meeting_output_path") or "").strip()
+    meeting_output_override = str(skills.get("meeting_output_override_path") or "").strip()
+    generated_skill_dir = str(skills.get("generated_meeting_output_dir") or "").strip()
     return {
         "store_path": str(resolve_workspace_path(str(runtime.get("store_path") or "data/delegate_sessions.json"))),
         "exports_dir": str(resolve_workspace_path(str(runtime.get("exports_dir") or "data/exports"))),
         "audio_archive_dir": str(resolve_workspace_path(str(runtime.get("audio_archive_dir") or "data/audio"))),
+        "meeting_output_skill_path": str(
+            resolve_workspace_path(meeting_output_skill or "skills/meeting-output-default/SKILL.md")
+        ),
+        "meeting_output_override_path": str(resolve_workspace_path(meeting_output_override))
+        if meeting_output_override
+        else "",
+        "generated_meeting_output_dir": str(
+            resolve_workspace_path(generated_skill_dir or "skills/generated")
+        ),
         "runtime_state_path": str(runtime_state_path(config)),
         "launcher_state_path": str(
             resolve_workspace_path(str(launcher.get("state_path") or ".tmp/zoom-meeting-bot/launcher-state.json"))
@@ -1145,6 +1595,22 @@ def _collect_interactive_config(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     _print_section("4. 런타임")
+    updated["skills"]["meeting_output_path"] = _prompt(
+        "meeting output skill path",
+        str(dict(updated.get("skills") or {}).get("meeting_output_path") or ""),
+        help_text="Example: skills/meeting-output-default/SKILL.md",
+    )
+    updated["skills"]["meeting_output_customization"] = _prompt(
+        "meeting output customization",
+        str(dict(updated.get("skills") or {}).get("meeting_output_customization") or ""),
+        help_text="Optional natural-language request that will be expanded into a reusable generated skill.",
+    )
+    updated["skills"]["generated_meeting_output_dir"] = _prompt(
+        "generated meeting output dir",
+        str(dict(updated.get("skills") or {}).get("generated_meeting_output_dir") or ""),
+        help_text="Example: skills/generated",
+    )
+
     updated["runtime"]["execution_mode"] = _prompt_described_choice(
         "실행 모드",
         str(updated["runtime"]["execution_mode"]),

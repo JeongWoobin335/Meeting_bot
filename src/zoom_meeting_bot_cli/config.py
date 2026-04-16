@@ -42,6 +42,15 @@ DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "whisper_cpp_command": "",
         "whisper_cpp_model": "",
     },
+    "skills": {
+        "meeting_output_path": "skills/meeting-output-default/SKILL.md",
+        "meeting_output_override_path": "",
+        "meeting_output_customization": "",
+        "generated_meeting_output_dir": "skills/generated",
+    },
+    "meeting_artifacts": {
+        "pdf_renderer": "docx",
+    },
     "telegram": {
         "enabled": False,
         "bot_name": "",

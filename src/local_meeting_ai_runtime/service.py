@@ -175,6 +175,12 @@ class DelegateService:
         session.touch()
         return self._store.save_session(session)
 
+    def _finalization_status(self, session: DelegateSession) -> str:
+        return str(dict(session.ai_state.get("finalization") or {}).get("status") or "").strip().lower()
+
+    def _finalization_blocks_live_updates(self, session: DelegateSession) -> bool:
+        return self._finalization_status(session) in {"queued", "processing", "completed"}
+
     def find_session_by_meeting(self, meeting_id: str) -> DelegateSession | None:
         normalized = str(meeting_id or "").strip()
         if not normalized:
@@ -227,6 +233,12 @@ class DelegateService:
 
     def record_shell_heartbeat(self, session_id: str, payload: dict[str, Any] | None = None) -> tuple[DelegateSession, dict[str, Any]]:
         session = self._require_session(session_id)
+        if self._finalization_blocks_live_updates(session):
+            return session, {
+                "heartbeat_at": str((payload or {}).get("heartbeat_at") or utcnow_iso()).strip() or utcnow_iso(),
+                "watch_state": dict(session.ai_state.get("meeting_end_watch") or {}),
+                "shell_liveness": dict(session.ai_state.get("shell_liveness") or {}),
+            }
         data = dict(payload or {})
         heartbeat_at = str(data.get("heartbeat_at") or utcnow_iso()).strip() or utcnow_iso()
         shell_state = dict(session.ai_state.get("shell_liveness") or {})
@@ -272,6 +284,8 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             raise ValueError("This meeting session is already completed, so new transcript input is not accepted.")
+        if self._finalization_blocks_live_updates(session):
+            return session
         self._record_input(
             session,
             input_type="spoken_transcript",
@@ -294,6 +308,8 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             raise ValueError("This meeting session is already completed, so new chat input is not accepted.")
+        if self._finalization_blocks_live_updates(session):
+            return session
         if self._should_ignore_chat_input(session, payload):
             return session
         role = str(payload.get("role") or "participant").strip().lower() or "participant"
@@ -344,6 +360,13 @@ class DelegateService:
         return self.persist_session(session)
 
     async def handle_chat_message(self, session_id: str, payload: dict[str, Any]) -> tuple[DelegateSession, dict[str, Any]]:
+        current_session = self._require_session(session_id)
+        if self._finalization_blocks_live_updates(current_session):
+            return current_session, {
+                "status": "ignored",
+                "reason": "Finalization is already in progress for this meeting session.",
+                "trigger": "finalization_in_progress",
+            }
         session = await self.append_chat_turn(session_id, payload)
         latest_turn = session.chat_history[-1]
         try:
@@ -363,6 +386,13 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             raise ValueError("This meeting session is already completed, so new meeting inputs are not accepted.")
+        if self._finalization_blocks_live_updates(session):
+            return session, {
+                "processed_count": 0,
+                "reply_attempted": False,
+                "reply_status": "ignored",
+                "ignored_reason": "finalization_in_progress",
+            }
         raw_inputs = payload.get("inputs")
         if raw_inputs is None:
             raw_inputs = [payload]
@@ -556,6 +586,12 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             raise LocalObserverError("This meeting session is already completed, so new audio should not be captured.")
+        if self._finalization_blocks_live_updates(session):
+            return session, {
+                "capture_mode": "ignored",
+                "captured_chunks": 0,
+                "ignored_reason": "finalization_in_progress",
+            }
         seconds = float(payload.get("seconds") or 8.0)
         if seconds <= 0:
             raise ValueError("seconds must be greater than zero for local audio observation.")
@@ -751,6 +787,8 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             raise LocalObserverError("This meeting session is already completed, so continuous audio observation cannot start.")
+        if self._finalization_blocks_live_updates(session):
+            return session, self.audio_observer_status(session_id)
         current = self._audio_observer_tasks.get(session_id)
         if current and not current.done():
             return session, self.audio_observer_status(session_id)
@@ -1542,6 +1580,11 @@ class DelegateService:
             session.status_reason = None
         session.summary_packet = self._summary_pipeline.build(session)
         ai_result = await self._ai.summarize_session(session)
+        ai_result = await self._ai.materialize_result_generation(
+            session,
+            ai_result,
+            output_dir=self._export_dir / session.session_id,
+        )
         session.summary = str(ai_result.get("summary") or "").strip()
         session.action_items = [str(item).strip() for item in ai_result.get("action_items", []) if str(item).strip()]
         self._apply_ai_summary_intelligence(session, ai_result)
@@ -1560,75 +1603,89 @@ class DelegateService:
         mode: str | None = None,
         requested_by: str = "api",
     ) -> tuple[DelegateSession, dict[str, Any]]:
-        completion_mode = self._resolve_completion_mode(mode)
-        await self.stop_audio_observer(session_id)
-        session = self._require_session(session_id)
-        requested_at = utcnow_iso()
+        lock = self._completion_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            completion_mode = self._resolve_completion_mode(mode)
+            session = self._require_session(session_id)
+            existing_finalization = dict(session.ai_state.get("finalization") or {})
+            existing_status = str(existing_finalization.get("status") or "").strip().lower()
+            existing_job_id = str(existing_finalization.get("job_id") or "").strip() or None
 
-        if completion_mode == "inline":
-            session = await self.complete_session(session_id)
+            if completion_mode == "queued" and existing_status in {"queued", "processing", "completed"}:
+                return session, {
+                    "mode": "queued",
+                    "status": existing_status,
+                    "job_id": existing_job_id,
+                }
+
+            await self.stop_audio_observer(session_id)
+            session = self._require_session(session_id)
+            requested_at = utcnow_iso()
+
+            if completion_mode == "inline":
+                session = await self.complete_session(session_id)
+                self._update_finalization_state(
+                    session,
+                    status="completed",
+                    mode="inline",
+                    requested_at=requested_at,
+                    completed_at=utcnow_iso(),
+                    requested_by=requested_by,
+                    last_error=None,
+                )
+                session = self.persist_session(session)
+                return session, {
+                    "mode": "inline",
+                    "status": "completed",
+                    "job_id": None,
+                }
+
+            if session.status == "completed":
+                self._update_finalization_state(
+                    session,
+                    status="completed",
+                    mode="queued",
+                    requested_at=requested_at,
+                    completed_at=utcnow_iso(),
+                    requested_by=requested_by,
+                    last_error=None,
+                )
+                session = self.persist_session(session)
+                return session, {
+                    "mode": "queued",
+                    "status": "completed",
+                    "job_id": None,
+                }
+
+            job = self._find_pending_finalize_job(session.session_id)
+            if job is None:
+                job = self._runner_store.enqueue_job(
+                    RunnerJob(
+                        job_id=uuid4().hex[:12],
+                        job_type="finalize_session",
+                        session_id=session.session_id,
+                        payload={
+                            "requested_by": requested_by,
+                            "requested_at": requested_at,
+                        },
+                    )
+                )
+            queue_status = "processing" if job.status == "leased" else "queued"
             self._update_finalization_state(
                 session,
-                status="completed",
-                mode="inline",
-                requested_at=requested_at,
-                completed_at=utcnow_iso(),
-                requested_by=requested_by,
-                last_error=None,
-            )
-            session = self.persist_session(session)
-            return session, {
-                "mode": "inline",
-                "status": "completed",
-                "job_id": None,
-            }
-
-        if session.status == "completed":
-            self._update_finalization_state(
-                session,
-                status="completed",
+                status=queue_status,
                 mode="queued",
                 requested_at=requested_at,
-                completed_at=utcnow_iso(),
                 requested_by=requested_by,
+                job_id=job.job_id,
                 last_error=None,
             )
             session = self.persist_session(session)
             return session, {
                 "mode": "queued",
-                "status": "completed",
-                "job_id": None,
+                "status": queue_status,
+                "job_id": job.job_id,
             }
-
-        job = self._find_pending_finalize_job(session.session_id)
-        if job is None:
-            job = self._runner_store.enqueue_job(
-                RunnerJob(
-                    job_id=uuid4().hex[:12],
-                    job_type="finalize_session",
-                    session_id=session.session_id,
-                    payload={
-                        "requested_by": requested_by,
-                        "requested_at": requested_at,
-                    },
-                )
-            )
-        queue_status = "processing" if job.status == "leased" else "queued"
-        self._update_finalization_state(
-            session,
-            status=queue_status,
-            mode="queued",
-            requested_at=requested_at,
-            requested_by=requested_by,
-            job_id=job.job_id,
-            last_error=None,
-        )
-        session = self.persist_session(session)
-        return session, {
-            "mode": "queued",
-            "status": queue_status,
-            "job_id": job.job_id,
-        }
 
     async def process_finalization_queue(
         self,
@@ -1757,6 +1814,8 @@ class DelegateService:
     async def scan_auto_completion_candidates(self) -> None:
         for session in self._store.list_sessions():
             if session.status == "completed":
+                continue
+            if self._finalization_blocks_live_updates(session):
                 continue
             decision = self._auto_completion_watchdog_decision(session)
             action = str(decision.get("action") or "")
@@ -3416,7 +3475,24 @@ class DelegateService:
         ]
         session.transcript_exports = [{"format": "md", "path": str(transcript_md)}]
         try:
-            session.summary_exports.extend(self._artifact_exporter.export_summary_bundle(summary_md))
+            briefing = dict((session.summary_packet or {}).get("briefing") or {})
+            renderer_profile = str(briefing.get("renderer_profile") or "default").strip() or "default"
+            rendering_policy = dict(briefing.get("rendering_policy") or {})
+            session_policy = dict(
+                dict(session.ai_state.get("meeting_output_skill") or {}).get("result_generation_policy") or {}
+            )
+            if session_policy:
+                rendering_policy = {**rendering_policy, **session_policy}
+            postprocess_requests = list(briefing.get("postprocess_requests") or [])
+            session.summary_exports.extend(
+                self._artifact_exporter.export_summary_bundle(
+                    summary_md,
+                    renderer_profile=renderer_profile,
+                    briefing=briefing,
+                    rendering_policy=rendering_policy,
+                    postprocess_requests=postprocess_requests,
+                )
+            )
         except ArtifactExportError as exc:
             session.ai_state["artifact_export_error"] = str(exc)
         finally:

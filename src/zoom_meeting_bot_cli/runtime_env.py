@@ -53,6 +53,8 @@ def build_runtime_env(config: dict[str, Any]) -> dict[str, str]:
     profile = dict(config.get("profile") or {})
     zoom = dict(config.get("zoom") or {})
     local_ai = dict(config.get("local_ai") or {})
+    skills = dict(config.get("skills") or {})
+    meeting_artifacts = dict(config.get("meeting_artifacts") or {})
     telegram = dict(config.get("telegram") or {})
     runtime = dict(config.get("runtime") or {})
 
@@ -63,6 +65,33 @@ def build_runtime_env(config: dict[str, Any]) -> dict[str, str]:
     _set(env, "DELEGATE_EXPORT_DIR", str(resolve_workspace_path(str(runtime.get("exports_dir") or "data/exports"))))
     _set(env, "DELEGATE_AUDIO_ARCHIVE_DIR", str(resolve_workspace_path(str(runtime.get("audio_archive_dir") or "data/audio"))))
     _set(env, "DELEGATE_REFERENCE_DOC_PATH", str((package_root() / "doc" / "templates" / "meeting-summary-reference.docx").resolve()))
+    _set(
+        env,
+        "DELEGATE_MEETING_OUTPUT_SKILL_PATH",
+        str(resolve_workspace_path(str(skills.get("meeting_output_path") or "skills/meeting-output-default/SKILL.md"))),
+    )
+    override_skill_path = str(skills.get("meeting_output_override_path") or "").strip()
+    if override_skill_path:
+        _set(
+            env,
+            "DELEGATE_MEETING_OUTPUT_OVERRIDE_PATH",
+            str(resolve_workspace_path(override_skill_path)),
+        )
+    _set(
+        env,
+        "DELEGATE_MEETING_OUTPUT_CUSTOMIZATION",
+        str(skills.get("meeting_output_customization") or "").strip(),
+    )
+    _set(
+        env,
+        "DELEGATE_GENERATED_MEETING_OUTPUT_DIR",
+        str(resolve_workspace_path(str(skills.get("generated_meeting_output_dir") or "skills/generated"))),
+    )
+    _set(
+        env,
+        "DELEGATE_MEETING_ARTIFACT_PDF_RENDERER",
+        str(meeting_artifacts.get("pdf_renderer") or "docx").strip(),
+    )
     _set(env, "DELEGATE_BOT_DISPLAY_NAME", str(profile.get("bot_name") or "").strip())
     _set(env, "DELEGATE_LOCAL_USER_SPEAKER_NAME", str(profile.get("bot_name") or "").strip())
     _set(env, "DELEGATE_AUTO_OBSERVE_AUDIO_MODE", str(runtime.get("audio_mode") or "conversation"))
