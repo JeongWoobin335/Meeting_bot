@@ -1,284 +1,244 @@
 # ZOOM_MEETING_BOT
 
-`zoom-meeting-bot` is a menu-driven CLI kit for running the Zoom Meeting Bot system on your own PC.
+`zoom-meeting-bot`은 자신의 PC에서 Zoom 회의를 수집하고, 로컬 AI 흐름으로 정리한 뒤, 최종 결과물을 PDF로 만들어주는 메뉴형 CLI 킷입니다.
 
-This package is meant for real end users, not only for people working directly inside this repository. If you install from npm, you do not need to clone the GitHub repo first.
+이 패키지는 GitHub 저장소를 직접 받아서 다루는 개발자용 문서보다, **npm으로 설치해서 바로 쓰는 실제 사용자**를 기준으로 안내합니다.
 
-## What This Package Does
+## 이 패키지로 할 수 있는 일
 
-- Joins Zoom meetings with your own config
-- Captures meeting audio locally
-- Summarizes the meeting with local AI pipelines
-- Generates meeting outputs as HTML/CSS-based PDFs by default
-- Lets you manage reusable meeting-output styles (`SKILL`)
+- Zoom 회의에 참가하기
+- 회의 음성을 로컬에서 수집하기
+- 회의 내용을 전사하고 정리하기
+- 회의 결과물을 기본적으로 HTML/CSS 기반 PDF로 만들기
+- 결과물 스타일(`SKILL`)을 관리하고 바꾸기
 
-The packaged default reference skill is:
+기본 레퍼런스 결과물 스타일은 아래 하나가 패키지에 포함됩니다.
 
 - `skills/meeting-output-default/SKILL.md`
 
-Generated custom skills are stored in your own workspace, not inside the npm package.
+사용자가 새로 만든 결과물 스타일은 패키지 폴더가 아니라 **사용자 작업 공간(workspace)** 안에 따로 저장됩니다.
 
-## Quick Start
+## 설치 전에 필요한 것
 
-### Requirements
+- Node.js 18 이상
+- npm
+- Python 3.11 이상
 
-- Node.js 18+ and npm
-- Python 3.11+
+중요한 점:
 
-### Install
+- 이 패키지는 npm으로 설치되지만, 실제 본체는 Python 기반으로 동작합니다.
+- 따라서 `npm install -g`만으로 끝나는 패키지는 아니고, **Python 3.11+가 실제로 있어야** 전체 시스템이 정상 동작합니다.
+
+## 설치 방법
 
 ```bash
 npm install -g zoom-meeting-bot
 ```
 
-### Run
+## 실행 방법
 
 ```bash
 zoom-meeting-bot
 ```
 
-Running `zoom-meeting-bot` with no arguments opens the Korean menu UI.
+아무 인자 없이 `zoom-meeting-bot`만 실행하면 한국어 메뉴 UI가 열립니다.
 
-## First-Run Experience
-
-On the first run, the CLI prepares the user workspace automatically. That includes:
-
-- creating a dedicated workspace folder
-- creating a local `.venv`
-- installing the Python runtime dependencies
-- creating the first config file
-- guiding you through `quickstart`
-
-Typical first-run flow:
-
-1. `zoom-meeting-bot`
-2. Choose `[1] 처음 설정하기`
-3. Finish the setup/config prompts
-4. Choose `[4] 회의 참가`
-
-Internally, the quickstart flow corresponds to:
-
-- `init`
-- `configure`
-- `setup`
-- `doctor`
-- `start`
-
-## Typical User Flow
-
-The simplest user path is:
+즉, 일반 사용자는 아래 두 줄만 알면 됩니다.
 
 ```bash
+npm install -g zoom-meeting-bot
 zoom-meeting-bot
 ```
 
-Then inside the menu:
+## 처음 실행하면 무엇이 일어나나
 
-- `[1] 처음 설정하기`
-- `[2] 런처 시작`
-- `[4] 회의 참가`
-- `[5] 현재 상태 보기`
-- `[6] 결과물 스타일 관리`
+처음 실행할 때 이 CLI는 사용자 작업 공간을 자동으로 준비합니다.
 
-For most end users, this menu flow is now the main entry point.
+대표적으로 아래가 자동으로 준비됩니다.
 
-## Direct CLI Commands
+- 사용자 작업 공간 폴더
+- `.venv`
+- Python 의존성 설치
+- 첫 설정 파일 생성
+- 초기 설정 흐름 안내
 
-If you prefer direct commands instead of the menu, these are the current equivalents:
+즉 예전처럼 사용자가 직접 저장소 폴더로 들어가서 `bootstrap.ps1` 같은 스크립트를 따로 기억할 필요 없이, 이제는 `zoom-meeting-bot`이 첫 진입점 역할을 맡습니다.
 
-### First-time setup
+## 기본 사용 흐름
 
-```bash
-zoom-meeting-bot quickstart --preset launcher_dm --yes
-```
+가장 쉬운 사용 흐름은 아래와 같습니다.
 
-### Join a meeting
+1. `zoom-meeting-bot` 실행
+2. 메뉴에서 `[1] 처음 설정하기` 선택
+3. 초기 설정 완료
+4. 메뉴에서 `[2] 런처 시작` 선택
+5. 메뉴에서 `[4] 회의 참가` 선택
+6. 회의 종료 후 결과물 확인
 
-```bash
-zoom-meeting-bot create-session "회의링크" --passcode "암호" --open
-```
+## 메뉴 설명
 
-### Runtime control
+현재 기본 메뉴는 아래처럼 구성됩니다.
 
-```bash
-zoom-meeting-bot start
-zoom-meeting-bot status
-zoom-meeting-bot stop
-```
+### `[1] 처음 설정하기`
 
-### Diagnostics
+처음 한 번 필요한 초기 설정 흐름입니다.
 
-```bash
-zoom-meeting-bot show-config
-zoom-meeting-bot doctor
-zoom-meeting-bot support-bundle
-```
+- 설정 파일 생성
+- 기본 환경 준비
+- 필요한 도구와 모델 준비
+- 실행 가능한 상태인지 점검
 
-### Skill management
+쉽게 말해, 예전의 `init + configure + setup + doctor + start` 흐름을 사용자 입장에서 한 번에 진행하는 메뉴입니다.
 
-```bash
-zoom-meeting-bot skill --help
-```
+### `[2] 런처 시작`
 
-## Presets
+회의를 받을 수 있도록 런처를 시작합니다.
 
-### `runtime_only`
+- Zoom 런타임 시작
+- 현재 설정 기준 실행 모드 반영
+- 이후 회의 참가 요청을 받을 준비 상태로 진입
 
-Use this if you want to validate the Zoom meeting engine and local export flow first.
+### `[3] 런처 중지`
 
-- runs the Zoom runtime without launcher routing
-- good for basic `meeting -> capture -> summarize -> PDF export` testing
+현재 실행 중인 런처를 중지합니다.
 
-### `launcher_dm`
+- 런처 종료
+- Zoom 런타임 종료
+- 현재 세션이 없을 때 안전하게 내릴 수 있음
 
-This is the most practical first preset for end users.
+### `[4] 회의 참가`
 
-- enables launcher mode
-- keeps Telegram artifact delivery ready
-- uses `personal_dm` as the default PDF artifact route
+실제 Zoom 회의 링크와 암호를 넣어서 회의 세션을 만드는 메뉴입니다.
 
-### `launcher_metheus`
+- 회의 링크 입력
+- 암호 입력
+- 회의 참가 페이지 열기
+- 세션 생성 및 회의 진행 준비
 
-Use this when you are integrating with a Metheus project route.
+### `[5] 현재 상태 보기`
 
-## What Users Need To Prepare
+지금 시스템이 어떤 상태인지 확인하는 메뉴입니다.
 
-During setup/configuration, users may need:
+- 설정 완료 여부
+- 런처 실행 여부
+- Zoom 엔진 상태
+- 현재 적용된 결과물 스타일
+- 필요하면 상세 기술 정보 확인
 
-- Zoom Client ID
-- Zoom Client Secret
-- Hugging Face token
-- optional Telegram bot token and route information
+문제가 생겼을 때 가장 먼저 보기 좋은 메뉴입니다.
 
-Telegram is not required for every flow. If you only want local exports first, start with `runtime_only`.
+### `[6] 결과물 스타일 관리`
 
-## Output Defaults
+회의 결과물의 스타일을 관리하는 메뉴입니다.
 
-Current packaged defaults are:
+- 현재 적용된 스타일 보기
+- 저장된 스타일 목록 보기
+- 다른 스타일로 바꾸기
+- 새 결과물 스타일 만들기
+- 기본 스타일로 되돌리기
 
-- base reference skill: `meeting-output-default`
-- generated skills: stored in the user workspace
-- PDF renderer: `html`
-- meeting outputs: HTML/CSS-first PDF flow
+즉 결과물의 분위기, 구성, 표현 방식을 조정하는 메뉴입니다.
 
-The old DOCX-first path is no longer the default user experience.
+### `[0] 종료`
 
-## whisper.cpp And Model Preparation
+메뉴를 종료합니다.
 
-`whisper.cpp` is treated as a core part of the runtime path.
+## 결과물 기본값
 
-The npm package includes the bundled runtime assets needed for the packaged flow, while heavy model files are prepared during setup as needed.
+현재 패키지 기준 기본값은 아래와 같습니다.
 
-In practice, users should think of it like this:
+- 기본 결과물 스타일: `meeting-output-default`
+- PDF 렌더 기본값: `html`
+- 결과물 생성 흐름: HTML/CSS 기반 PDF
 
-- the npm package installs the CLI entry point
-- first-run setup prepares the local runtime environment
-- model and tool preparation still happens during setup/quickstart
+즉 지금의 기본 사용자 경험은 예전 DOCX 중심이 아니라, **HTML/CSS 기반 PDF 생성 흐름**입니다.
 
-## Workspace Location
+## whisper.cpp와 모델 준비
 
-By default, the package uses a user-level workspace instead of writing mutable data into the npm install directory.
+`whisper.cpp`는 이 시스템에서 중요한 축입니다.
 
-Typical workspace roots:
+다만 무거운 모델 파일까지 npm 패키지에 전부 넣는 대신, 실제 첫 설정 과정에서 필요한 자산과 모델을 준비하는 방식으로 동작합니다.
+
+사용자 입장에서는 이렇게 이해하면 됩니다.
+
+- npm 패키지는 실행 진입점을 설치한다
+- 첫 설정은 실제 로컬 실행 환경을 준비한다
+- 모델과 도구 준비는 초기 설정 흐름 안에서 이어진다
+
+## 작업 공간(workspace) 위치
+
+이 패키지는 가변 데이터를 npm 설치 폴더 안에 쓰지 않고, 사용자 작업 공간에 따로 보관합니다.
+
+대표적으로 작업 공간에는 아래가 들어갑니다.
+
+- 설정 파일
+- `.venv`
+- exports
+- audio archive
+- generated skills
+- runtime state
+
+일반적으로는 운영체제별 사용자 영역 아래에 자동 생성됩니다.
+
+예:
 
 - Windows: `%LOCALAPPDATA%\zoom-meeting-bot`
 - macOS: `~/Library/Application Support/zoom-meeting-bot`
 - Linux: `~/.local/share/zoom-meeting-bot`
 
-This workspace holds things like:
+## 처음 쓰는 사용자에게 권장하는 방식
 
-- config files
-- `.venv`
-- exports
-- audio archives
-- generated skills
-- runtime state files
+처음에는 복잡한 명령어를 직접 외우기보다, 아래 흐름만 따라가는 것을 권장합니다.
 
-## Important Note About Python
+1. `npm install -g zoom-meeting-bot`
+2. `zoom-meeting-bot`
+3. `[1] 처음 설정하기`
+4. `[2] 런처 시작`
+5. `[4] 회의 참가`
 
-Although the package is installed through npm, the core runtime is Python-based.
+즉, 이 프로젝트의 현재 기준 사용자 입구는 **명령어 묶음이 아니라 메뉴형 CLI**입니다.
 
-That means:
+## 문제 생기면 어디를 보면 되나
 
-- Node.js/npm is needed to install the package
-- Python 3.11+ is needed to actually run the full system
+문제가 생겼을 때는 아래 순서로 보는 것이 좋습니다.
 
-If `zoom-meeting-bot` reports that Python 3.11+ was not found, install Python first and run the command again.
+1. 메뉴의 `[5] 현재 상태 보기`
+2. 필요하면 `show-config`
+3. 필요하면 `doctor`
+4. 필요하면 `support-bundle`
 
-## Troubleshooting
+즉 먼저 상태를 보고, 그다음 설정과 진단 결과를 확인하는 흐름이 가장 자연스럽습니다.
 
-### Show the effective config
+## GitHub를 꼭 받아야 하나
 
-```bash
-zoom-meeting-bot show-config
-```
+아닙니다.
 
-### Check prerequisites and blocking issues
-
-```bash
-zoom-meeting-bot doctor
-```
-
-### Check runtime status
-
-```bash
-zoom-meeting-bot status
-```
-
-### Generate a support bundle
-
-```bash
-zoom-meeting-bot support-bundle
-```
-
-## Repository Workflow vs npm Workflow
-
-There are now two different ways to use this project:
-
-### 1. End-user npm workflow
-
-Recommended for normal users:
+이제 일반 사용자는 GitHub 저장소를 직접 받을 필요 없이 아래 두 줄만으로 설치와 실행이 가능합니다.
 
 ```bash
 npm install -g zoom-meeting-bot
 zoom-meeting-bot
 ```
 
-### 2. Source-checkout workflow
+GitHub 저장소는 소스코드와 이력, 문서의 기준 저장소 역할을 하고, npm은 실제 설치 배포 창구 역할을 합니다.
 
-Still useful if you are developing directly inside this repository:
+## 이 프로젝트의 방향
 
-Windows:
+이 프로젝트의 목표는 특정 한 사람의 Zoom 봇 복제본 하나만 만드는 것이 아닙니다.
 
-```powershell
-.\scripts\bootstrap.ps1
-.\scripts\zoom-meeting-bot.ps1
-```
+목표는 다른 사용자도 자신의 환경에서:
 
-macOS:
+- 자기 Zoom 앱 정보
+- 자기 Hugging Face token
+- 자기 Telegram 설정
+- 자기 PC 환경
+- 자기 결과물 스타일
 
-```bash
-./scripts/bootstrap.sh
-./scripts/zoom-meeting-bot.sh
-```
+을 넣어서 **자기만의 Zoom Meeting Bot 시스템**을 실행할 수 있게 만드는 것입니다.
 
-The old script-based flow still exists, but it is no longer the main end-user onboarding path for the packaged CLI.
+그 방향 때문에 현재 제품 구조는 아래 중심으로 정리되어 있습니다.
 
-## Project Direction
-
-The goal of this project is not to hardcode one single `WooBIN_bot` instance forever.
-
-The goal is to let other users run the same Zoom meeting bot system on their own machines with:
-
-- their own Zoom app credentials
-- their own Hugging Face token
-- their own Telegram routing
-- their own local environment
-- their own meeting-output style
-
-That is why the product direction is now centered on:
-
-- npm installation
-- menu-driven CLI onboarding
-- packaged default reference skill
-- user-workspace-based runtime state
+- npm 설치
+- 메뉴형 CLI 진입
+- 기본 레퍼런스 결과물 스타일 포함
+- 사용자 작업 공간 기반 상태 관리
