@@ -16,7 +16,7 @@ from local_meeting_ai_runtime.models import DelegateSession
 
 
 class AiClientSummaryContractTest(unittest.TestCase):
-    def test_codex_summarize_prompt_includes_raw_skill_block(self) -> None:
+    def test_codex_summarize_prompt_uses_text_only_skill_block(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_path = Path(temp_dir) / "SKILL.md"
             skill_path.write_text(
@@ -25,7 +25,9 @@ class AiClientSummaryContractTest(unittest.TestCase):
                 "description: custom skill\n"
                 "---\n\n"
                 "# Custom Meeting Output\n\n"
-                "- Keep the summary grounded in the actual meeting agenda.\n",
+                "- Keep the summary grounded in the actual meeting agenda.\n\n"
+                "## Visuals\n\n"
+                "- Use nano-banana 2 for one supporting image per core topic.\n",
                 encoding="utf-8",
             )
             previous_skill_path = os.environ.get("DELEGATE_MEETING_OUTPUT_SKILL_PATH")
@@ -58,7 +60,18 @@ class AiClientSummaryContractTest(unittest.TestCase):
                 "decisions": [],
                 "open_questions": [],
                 "risk_signals": [],
-                "postprocess_requests": [],
+                "postprocess_requests": [
+                    {
+                        "kind": "image_brief",
+                        "title": "Skill visual",
+                        "instruction": "Create one supporting visual.",
+                    },
+                    {
+                        "kind": "appendix_note",
+                        "title": "Appendix note",
+                        "instruction": "Keep one non-visual appendix note.",
+                    },
+                ],
                 "sections": [
                     {
                         "heading": "Skill linkage",
@@ -70,10 +83,43 @@ class AiClientSummaryContractTest(unittest.TestCase):
 
         client._codex_json_response = fake_codex_json_response
 
-        client._codex_summarize(session)
+        result = client._codex_summarize(session)
 
         self.assertIn("Base result-generation skill:", captured_request["text"])
         self.assertIn("Keep the summary grounded in the actual meeting agenda.", captured_request["text"])
+        self.assertNotIn("Use nano-banana 2 for one supporting image per core topic.", captured_request["text"])
+        self.assertIn("Do not emit image briefs", captured_request["text"])
+        self.assertEqual(
+            result["postprocess_requests"],
+            [
+                {
+                    "kind": "appendix_note",
+                    "title": "Appendix note",
+                    "instruction": "Keep one non-visual appendix note.",
+                    "prompt": "",
+                    "tool_hint": "",
+                    "caption": "",
+                    "image_path": "",
+                    "count": "1",
+                    "placement_notes": "",
+                    "target_heading": "",
+                    "agenda_context": "",
+                    "block_focus": "",
+                    "core_message": "",
+                    "visual_archetype": "",
+                    "visual_center": "",
+                    "composition_notes": "",
+                    "style_notes": "",
+                    "review_feedback": "",
+                    "review_status": "",
+                    "review_note": "",
+                    "key_entities": [],
+                    "key_relationships": [],
+                    "must_include_labels": [],
+                    "avoid_elements": [],
+                }
+            ],
+        )
         removed_layer_key = "execution" + "_plan"
         self.assertNotIn(removed_layer_key, captured_request["text"])
 
@@ -112,6 +158,94 @@ class AiClientSummaryContractTest(unittest.TestCase):
             "- Put the image directly inside the document.",
             list(dict(state.get("design_intent_packet") or {}).get("directive_lines") or []),
         )
+
+    def test_materialize_result_generation_keeps_non_visual_requests_and_adds_synthesized_images(self) -> None:
+        client = AiDelegateClient()
+        session = DelegateSession(
+            session_id="ai-summary-merge-1",
+            delegate_mode="answer_on_ask",
+            bot_display_name="WooBIN_bot",
+            meeting_topic="Merged postprocess flow",
+            status="completed",
+        )
+        session.ai_state["meeting_output_skill"] = {
+            "body": "# Visuals\n\n- Create one nano-banana 2 image tied to the core section.\n",
+            "metadata": {},
+            "result_generation_policy": {},
+        }
+
+        async def fake_generate_result_images(_session, *, count, output_dir, **_kwargs):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            path = output_dir / "merged-1.png"
+            path.write_bytes(b"fake-image")
+            return [path]
+
+        async def fake_review_result_images(_session, *, candidate_paths, **_kwargs):
+            return (list(candidate_paths), [])
+
+        def fake_codex_json_response(_session, _request_text, **_kwargs):
+            return {
+                "requests": [
+                    {
+                        "kind": "image_brief",
+                        "title": "Core frame visual",
+                        "instruction": "Create one supporting image.",
+                        "prompt": "Create a clean concept visual.",
+                        "tool_hint": "nano-banana",
+                        "caption": "Core frame visual",
+                        "count": "1",
+                        "placement_notes": "Place after the core section",
+                        "target_heading": "Core frame",
+                    }
+                ]
+            }
+
+        client._generate_result_images = fake_generate_result_images
+        client._review_result_image_candidates = fake_review_result_images
+        client._codex_json_response = fake_codex_json_response
+        client._build_result_image_structure_plan = lambda *_args, **_kwargs: {
+            "agenda_context": "Core meeting context",
+            "block_focus": "Core section meaning",
+            "core_message": "One visual should support the core section.",
+            "visual_archetype": "concept_frame",
+            "visual_center": "A centered concept frame",
+            "key_entities": ["core frame"],
+            "key_relationships": ["supporting explanation"],
+            "must_include_labels": ["core frame"],
+            "avoid_elements": ["generic stock art"],
+            "composition_notes": "Keep the focal structure centered.",
+            "style_notes": "Keep the visual clean.",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = asyncio.run(
+                client.materialize_result_generation(
+                    session,
+                    {
+                        "title": "Merged postprocess flow",
+                        "executive_summary": "The text result should survive before images are added.",
+                        "sections": [
+                            {
+                                "heading": "Core frame",
+                                "summary": "The meeting defined the core frame.",
+                            }
+                        ],
+                        "postprocess_requests": [
+                            {
+                                "kind": "appendix_note",
+                                "title": "Appendix note",
+                                "instruction": "Preserve this non-visual request.",
+                            }
+                        ],
+                    },
+                    output_dir=Path(temp_dir),
+                )
+            )
+
+        self.assertEqual(len(result["postprocess_requests"]), 2)
+        self.assertEqual(result["postprocess_requests"][0]["kind"], "appendix_note")
+        self.assertEqual(result["postprocess_requests"][1]["kind"], "image_brief")
+        self.assertTrue(str(result["postprocess_requests"][1]["image_path"] or "").endswith(".png"))
 
     def test_apply_resolved_renderer_theme_uses_codex_font_resolution_for_abstract_request_without_keyword_gate(self) -> None:
         client = AiDelegateClient()
@@ -220,7 +354,7 @@ class AiClientSummaryContractTest(unittest.TestCase):
         self.assertEqual(policy.get("renderer_heading_font"), "SUIT")
         self.assertEqual(policy.get("renderer_body_font"), "Noto Sans KR")
         self.assertIn("first use web search", captured_request["text"])
-        self.assertIn("?ㅼ씠踰꾩쓽 怨듦컻 釉뚮옖??遺꾩쐞湲?, captured_request["text"])
+        self.assertIn("renderer_theme_name", captured_request["text"])
 
     def test_synthesize_postprocess_requests_from_raw_skill_block(self) -> None:
         client = AiDelegateClient()
@@ -332,24 +466,30 @@ class AiClientSummaryContractTest(unittest.TestCase):
         client._generate_result_images = fake_generate_result_images
         client._codex_json_response = fake_codex_json_response
         client._build_result_image_structure_plan = lambda *_args, **_kwargs: {
-            "agenda_context": "?뚯쓽 ?꾩껜??梨낆엫 二쇱껜? ?뱀씤 泥닿퀎瑜??ъ젙?섑븯????珥덉젏???덈떎.",
-            "block_focus": "??釉붾줉? 梨낆엫 二쇱껜, ?뱀씤 寃뚯씠?? 寃???먮쫫??吏묒쨷?쒕떎.",
-            "core_message": "AI ?댁쁺 寃곌낵?먮뒗 紐낆떆?곸씤 梨낆엫 二쇱껜? ?뱀씤 ?먮쫫???덉뼱???쒕떎.",
-            "visual_center": "梨낆엫 二쇱껜? ?뱀씤 寃뚯씠?멸? ?곌껐??以묒븰 援ъ“",
-            "key_entities": ["梨낆엫 二쇱껜", "?뱀씤 寃뚯씠??, "寃???먮쫫"],
-            "key_relationships": ["寃곌낵 ?앹꽦 ??梨낆엫 ?뺤씤", "寃?????뱀씤", "?댁쓽?쒓린 ???ш???],
-            "must_include_labels": ["梨낆엫 二쇱껜", "?뱀씤", "寃??, "?ш???],
-            "avoid_elements": ["源⑥쭊 ?쒓?", "臾닿????щ줈嫄?],
+            "agenda_context": "The meeting organized responsibility owners and approval gates.",
+            "block_focus": "This block explains the responsibility map and approval sequence.",
+            "core_message": "AI outputs need explicit responsibility owners and approval gates.",
+            "visual_archetype": "responsibility_map",
+            "visual_center": "A centered responsibility map with approval gates",
+            "key_entities": ["responsibility owner", "approval gate", "review flow"],
+            "key_relationships": ["generation to review", "review to approval"],
+            "must_include_labels": ["responsibility", "review", "approval"],
+            "avoid_elements": ["generic office photo", "empty abstract background"],
+            "composition_notes": "Show the responsibility path before decorative details.",
+            "style_notes": "Keep the image clean and document-like.",
         }
         client._build_result_image_structure_plan = lambda *_args, **_kwargs: {
-            "agenda_context": "?뚯쓽 ?꾩껜??梨낆엫 二쇱껜? ?뱀씤 泥닿퀎瑜??ъ젙?섑븯????珥덉젏???덈떎.",
-            "block_focus": "??釉붾줉? 梨낆엫 二쇱껜, ?뱀씤 寃뚯씠?? 寃???먮쫫??吏묒쨷?쒕떎.",
-            "core_message": "AI ?댁쁺 寃곌낵?먮뒗 紐낆떆?곸씤 梨낆엫 二쇱껜? ?뱀씤 ?먮쫫???덉뼱???쒕떎.",
-            "visual_center": "梨낆엫 二쇱껜? ?뱀씤 寃뚯씠?멸? ?곌껐??以묒븰 援ъ“",
-            "key_entities": ["梨낆엫 二쇱껜", "?뱀씤 寃뚯씠??, "寃???먮쫫"],
-            "key_relationships": ["寃곌낵 ?앹꽦 ??梨낆엫 ?뺤씤", "寃?????뱀씤", "?댁쓽?쒓린 ???ш???],
-            "must_include_labels": ["梨낆엫 二쇱껜", "?뱀씤", "寃??, "?ш???],
-            "avoid_elements": ["源⑥쭊 ?쒓?", "臾닿????щ줈嫄?],
+            "agenda_context": "The meeting organized responsibility owners and approval gates.",
+            "block_focus": "This block explains the responsibility map and approval sequence.",
+            "core_message": "AI outputs need explicit responsibility owners and approval gates.",
+            "visual_archetype": "responsibility_map",
+            "visual_center": "A centered responsibility map with approval gates",
+            "key_entities": ["responsibility owner", "approval gate", "review flow"],
+            "key_relationships": ["generation to review", "review to approval"],
+            "must_include_labels": ["responsibility", "review", "approval"],
+            "avoid_elements": ["generic office photo", "empty abstract background"],
+            "composition_notes": "Show the responsibility path before decorative details.",
+            "style_notes": "Keep the image clean and document-like.",
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -22,6 +22,23 @@ class _DummyAiClient:
     def quality_readiness(self) -> dict[str, object]:
         return {}
 
+    async def summarize_session(self, _session: DelegateSession) -> dict[str, object]:
+        return {
+            "summary": "summary ready",
+            "action_items": ["follow up"],
+            "postprocess_requests": [],
+        }
+
+    async def materialize_result_generation(
+        self,
+        _session: DelegateSession,
+        ai_result: dict[str, object],
+        *,
+        output_dir: Path,
+        progress_callback=None,
+    ) -> dict[str, object]:
+        return dict(ai_result)
+
 
 class SessionStoreArchitectureTest(unittest.TestCase):
     def test_save_session_migrates_to_per_session_file_and_overrides_legacy_entry(self) -> None:
@@ -60,15 +77,26 @@ class SessionFinalizationBoundaryTest(unittest.IsolatedAsyncioTestCase):
         base = Path(temp_dir)
         store = SessionStore(path=str(base / "delegate_sessions.json"))
         runner_store = RunnerQueueStore(path=str(base / "runner_queue.json"))
+        artifact_exporter = mock.Mock()
+        artifact_exporter.export_summary_bundle.return_value = []
+        local_observer = mock.Mock()
+        local_observer.audio_quality_readiness.return_value = {}
+        local_observer.meeting_output_device_name = ""
+        summary_pipeline = mock.Mock()
+        summary_pipeline.build.return_value = {"briefing": {}, "meeting_intelligence": {}}
+        summary_pipeline.build_briefing.return_value = {}
+        summary_pipeline.render_summary_markdown.return_value = "# summary\n"
+        summary_pipeline.render_transcript_markdown.return_value = "# transcript\n"
+        summary_pipeline._display_title.return_value = "회의 요약"
         service = DelegateService(
             store=store,
             runner_store=runner_store,
             zoom_client=mock.Mock(),
             ai_client=_DummyAiClient(),
             meeting_adapter=mock.Mock(),
-            local_observer=mock.Mock(),
-            summary_pipeline=mock.Mock(),
-            artifact_exporter=mock.Mock(),
+            local_observer=local_observer,
+            summary_pipeline=summary_pipeline,
+            artifact_exporter=artifact_exporter,
             export_dir=base / "exports",
         )
         return service, store, runner_store
@@ -193,6 +221,29 @@ class SessionFinalizationBoundaryTest(unittest.IsolatedAsyncioTestCase):
                 str(dict(refreshed.ai_state.get("finalization") or {}).get("status") or "").strip().lower(),
                 "completed",
             )
+
+    async def test_complete_session_records_completion_timing_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, store, _runner_store = self._build_service(temp_dir)
+            session = DelegateSession(
+                session_id="timing-session",
+                delegate_mode="answer_on_ask",
+                bot_display_name="WooBIN_bot",
+                status="active",
+            )
+            store.save_session(session)
+
+            completed = await service.complete_session(session.session_id)
+
+            timing = dict(completed.ai_state.get("performance_timing") or {}).get("completion_pipeline")
+            self.assertIsInstance(timing, dict)
+            assert isinstance(timing, dict)
+            self.assertEqual(timing.get("status"), "completed")
+            self.assertIn("summary_packet_build", timing)
+            self.assertIn("summarize_session", timing)
+            self.assertIn("result_materialization", timing)
+            self.assertIn("artifact_export", timing)
+            self.assertGreaterEqual(float(timing.get("elapsed_seconds") or 0.0), 0.0)
 
 
 if __name__ == "__main__":

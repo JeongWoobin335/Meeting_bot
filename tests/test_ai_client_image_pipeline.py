@@ -146,6 +146,16 @@ class AiClientImagePipelineTest(unittest.TestCase):
         self.assertEqual(len(result["postprocess_requests"]), 1)
         self.assertTrue(str(result["postprocess_requests"][0]["image_path"]).endswith(".png"))
         self.assertEqual(result["postprocess_requests"][0]["review_status"], "approved")
+        timing = dict(session.ai_state.get("performance_timing") or {}).get("result_generation")
+        self.assertIsInstance(timing, dict)
+        assert isinstance(timing, dict)
+        self.assertEqual(timing.get("status"), "completed")
+        self.assertEqual(timing.get("image_request_count"), 1)
+        self.assertEqual(len(list(timing.get("requests") or [])), 1)
+        request_timing = dict(list(timing.get("requests") or [])[0])
+        self.assertEqual(request_timing.get("status"), "approved")
+        self.assertGreaterEqual(float(request_timing.get("preparation_seconds") or 0.0), 0.0)
+        self.assertEqual(len(list(request_timing.get("attempts") or [])), 1)
 
     def test_materialize_result_generation_keeps_request_but_skips_rejected_image(self) -> None:
         client = AiDelegateClient()
@@ -224,10 +234,19 @@ class AiClientImagePipelineTest(unittest.TestCase):
         self.assertEqual(result["postprocess_requests"][0]["review_status"], "rejected")
         self.assertIn("책임 관계 구조", str(result["postprocess_requests"][0]["review_note"]))
         self.assertIn("result_generation_errors", session.ai_state)
+        timing = dict(session.ai_state.get("performance_timing") or {}).get("result_generation")
+        self.assertIsInstance(timing, dict)
+        assert isinstance(timing, dict)
+        self.assertEqual(timing.get("status"), "completed")
+        request_timing = dict(list(timing.get("requests") or [])[0])
+        self.assertEqual(request_timing.get("status"), "rejected")
+        self.assertEqual(request_timing.get("approved_count"), 0)
+        self.assertIn("책임 관계 구조", str(request_timing.get("review_note") or ""))
 
     def test_build_codex_command_keeps_schema_on_resume(self) -> None:
         client = AiDelegateClient()
         client._codex_path = "codex"
+        client._codex_resume_supports_output_schema = True
 
         command = client._build_codex_command(
             output_path=Path("C:/tmp/output.json"),

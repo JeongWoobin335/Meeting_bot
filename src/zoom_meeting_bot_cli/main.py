@@ -70,7 +70,7 @@ from .paths import package_root, resolve_relative_path, resolve_workspace_path, 
 from .runtime_env import runtime_host, runtime_port, runtime_state_path
 from .model_manager import prepare_models
 from .package_manager import build_distribution_bundle
-from .platform_support import MACOS, command_candidates_exist, current_platform_id, tool_install_plans
+from .platform_support import MACOS, WINDOWS, command_candidates_exist, current_platform_id, tool_install_plans
 from .setup_manager import run_setup
 
 EXECUTION_MODE_CHOICES: list[tuple[str, str, str]] = [
@@ -2641,11 +2641,22 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
         warnings.append("torch is not installed yet, so CUDA quality readiness could not be verified.")
         _report("torch.cuda runtime", "warning", str(torch_runtime.get("detail") or "torch is not installed."))
 
-    if audio_mode in {"conversation", "mixed", "system"}:
+    if platform_id == WINDOWS and audio_mode in {"conversation", "mixed", "system"}:
+        from local_meeting_ai_runtime.local_observer import LocalObserver
+
+        windows_helper_ready = LocalObserver().windows_audio_capture_available()
+        if windows_helper_ready:
+            _report("windows native audio helper", "ok", "Windows native audio helper is ready.")
+        else:
+            problems.append("Windows native audio helper is not available.")
+            _report("windows native audio helper", "missing", "Windows native audio helper is not available.")
+        _check_python_module("soundfile", "soundfile", problems, required=True)
+    elif audio_mode in {"conversation", "mixed", "system"}:
         _check_python_module("soundcard", "soundcard", problems, required=True)
         _check_python_module("soundfile", "soundfile", problems, required=True)
     else:
-        _check_python_module("soundcard", "soundcard", warnings, required=False)
+        if platform_id != WINDOWS:
+            _check_python_module("soundcard", "soundcard", warnings, required=False)
         _check_python_module("soundfile", "soundfile", warnings, required=False)
 
     _check_python_module("faster_whisper", "faster-whisper", problems, required=True)
@@ -2670,7 +2681,7 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
         expect_file=True,
         discovered_path=discovered_whisper_cpp_model,
     )
-    if platform_id == MACOS and audio_mode in {"conversation", "mixed", "system"}:
+    if platform_id in {MACOS, WINDOWS} and audio_mode in {"conversation", "mixed", "system"}:
         from local_meeting_ai_runtime.local_observer import LocalObserver
 
         observer_readiness = LocalObserver().audio_quality_readiness()

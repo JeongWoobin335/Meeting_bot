@@ -1,6 +1,6 @@
 {
   "name": "zoom-meeting-bot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Global npm launcher for the Zoom Meeting Bot CLI kit.",
   "author": "Jeong Woobin",
   "license": "UNLICENSED",
@@ -25,6 +25,7 @@
     "pyproject.toml",
     "skills/meeting-output-default",
     "src/**/*.py",
+    "tools/windows-audio-recorder/bin/Release/net8.0-windows",
     "tools/whisper.cpp/build/bin/Release",
     "tools/whisper.cpp/models/download-ggml-model.cmd",
     "tools/whisper.cpp/models/download-ggml-model.sh",

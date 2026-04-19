@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Callable
 import wave
 import gc
@@ -44,7 +45,30 @@ from .meeting_output_skill import (
     resolve_generated_meeting_output_dir,
     write_generated_meeting_output_skill,
 )
-from .models import DelegateSession, TranscriptChunk
+from .models import DelegateSession, TranscriptChunk, utcnow_iso
+
+SUMMARY_STAGE_EXCLUDED_METADATA_KEYS = {
+    "show_postprocess_requests",
+    "max_postprocess_requests",
+    "postprocess_image_width_inches",
+    "postprocess_requests_heading",
+    "empty_postprocess_requests_message",
+}
+SUMMARY_STAGE_VISUAL_KEYWORDS = (
+    "이미지",
+    "시각 자료",
+    "시각자료",
+    "비주얼",
+    "nano-banana",
+    "nanobanana",
+    "image brief",
+    "image_brief",
+    "visual appendix",
+    "visuals",
+    "postprocess",
+    "후속 결과물",
+    "추가 결과물",
+)
 
 
 class AiDelegateClient:
@@ -230,14 +254,49 @@ class AiDelegateClient:
         materialized = dict(ai_result or {})
         self._apply_resolved_renderer_theme(session)
         requests = self._clean_result_generation_requests(materialized.get("postprocess_requests"))
-        if not requests:
-            requests = self._synthesize_postprocess_requests_from_skill(
+        has_image_request = any(
+            str(item.get("kind") or "").strip().lower() == "image_brief"
+            for item in requests
+        )
+        if not has_image_request:
+            synthesized_requests = self._synthesize_postprocess_requests_from_skill(
                 session,
                 ai_result=materialized,
             )
+            if synthesized_requests:
+                requests.extend(synthesized_requests)
+        non_image_request_count = len(
+            [
+                item
+                for item in requests
+                if str(item.get("kind") or "").strip().lower() != "image_brief"
+                or str(item.get("image_path") or "").strip()
+            ]
+        )
+        timing_started_at = self._now_iso()
+        timing_perf = time.perf_counter()
+        timing_bucket = self._begin_result_generation_timing(
+            session,
+            started_at=timing_started_at,
+            request_count=len(requests),
+            non_image_request_count=non_image_request_count,
+        )
         if not requests:
             materialized["postprocess_requests"] = []
+            finished_at = self._now_iso()
+            timing_bucket.update(
+                {
+                    "status": "skipped",
+                    "reason": "no_postprocess_requests",
+                    "image_request_count": 0,
+                    "requests": [],
+                    "finished_at": finished_at,
+                    "elapsed_seconds": round(max(time.perf_counter() - timing_perf, 0.0), 3),
+                    "updated_at": finished_at,
+                }
+            )
             return materialized
+        request_timings: list[dict[str, Any]] = []
         resolved_requests = await self._materialize_result_generation_requests(
             session,
             requests,
@@ -245,8 +304,29 @@ class AiDelegateClient:
             title=str(materialized.get("title") or "").strip(),
             context_result=materialized,
             progress_callback=progress_callback,
+            timing_entries=request_timings,
         )
         materialized["postprocess_requests"] = resolved_requests
+        image_request_count = len(
+            [
+                item
+                for item in requests
+                if str(item.get("kind") or "").strip().lower() == "image_brief"
+                and not str(item.get("image_path") or "").strip()
+            ]
+        )
+        finished_at = self._now_iso()
+        timing_bucket.update(
+            {
+                "status": "completed" if image_request_count else "skipped",
+                "reason": "" if image_request_count else "no_image_generation_requests",
+                "image_request_count": image_request_count,
+                "requests": request_timings,
+                "finished_at": finished_at,
+                "elapsed_seconds": round(max(time.perf_counter() - timing_perf, 0.0), 3),
+                "updated_at": finished_at,
+            }
+        )
         return materialized
 
     @property
@@ -285,26 +365,49 @@ class AiDelegateClient:
     def release_quality_runtime_resources(self) -> dict[str, Any]:
         released_compute_types = list(self._faster_whisper_models.keys())
         released_pyannote = self._pyannote_pipeline is not None
-        self._faster_whisper_models.clear()
-        self._pyannote_pipeline = None
-        gc.collect()
-
-        cuda_cache_cleared = False
-        if importlib.util.find_spec("torch") is not None:
-            try:
-                import torch  # type: ignore[import-not-found]
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    cuda_cache_cleared = True
-            except Exception:
-                cuda_cache_cleared = False
+        self._release_faster_whisper_runtime()
+        self._release_pyannote_runtime()
+        cuda_cache_cleared = self._clear_torch_cuda_cache()
         return {
             "released_compute_types": released_compute_types,
             "released_model_count": len(released_compute_types),
             "released_pyannote_pipeline": released_pyannote,
             "cuda_cache_cleared": cuda_cache_cleared,
         }
+
+    def _release_faster_whisper_runtime(self) -> None:
+        self._faster_whisper_models.clear()
+        gc.collect()
+
+    def _release_pyannote_runtime(self) -> None:
+        self._pyannote_pipeline = None
+        gc.collect()
+
+    def _clear_torch_cuda_cache(self) -> bool:
+        if importlib.util.find_spec("torch") is None:
+            return False
+        try:
+            import torch  # type: ignore[import-not-found]
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _release_quality_runtime_phase(
+        self,
+        *,
+        release_faster_whisper: bool = False,
+        release_pyannote: bool = False,
+    ) -> None:
+        if release_faster_whisper:
+            self._release_faster_whisper_runtime()
+        if release_pyannote:
+            self._release_pyannote_runtime()
+        if release_faster_whisper or release_pyannote:
+            self._clear_torch_cuda_cache()
 
     def quality_readiness(self) -> dict[str, Any]:
         blocking_reasons: list[str] = []
@@ -379,9 +482,13 @@ class AiDelegateClient:
             chunks.extend(microphone_result["chunks"])
             dropped_segment_count += int(microphone_result["dropped_segment_count"])
             used_compute_type = str(microphone_result.get("compute_type") or used_compute_type)
+            if meeting_output_path:
+                # Avoid overlapping Whisper GPU residency with diarization GPU residency.
+                self._release_quality_runtime_phase(release_faster_whisper=True)
 
         if meeting_output_path:
             diarization_segments = self._run_pyannote_diarization(Path(meeting_output_path))
+            self._release_quality_runtime_phase(release_pyannote=True)
             meeting_output_result = self._transcribe_final_channel_with_faster_whisper(
                 Path(meeting_output_path),
                 fallback_speaker="remote_participant",
@@ -394,6 +501,7 @@ class AiDelegateClient:
             chunks.extend(meeting_output_result["chunks"])
             dropped_segment_count += int(meeting_output_result["dropped_segment_count"])
             used_compute_type = str(meeting_output_result.get("compute_type") or used_compute_type)
+            self._release_quality_runtime_phase(release_faster_whisper=True)
 
         chunks.sort(
             key=lambda chunk: (
@@ -528,17 +636,16 @@ class AiDelegateClient:
             "The JSON keys are internal transport slots, not rigid user-facing labels.\n"
             "If the skill redefines a block's displayed role or meaning, keep the JSON key but write the content to match that skill meaning.\n"
             "For example, the internal `decisions` slot may hold 검토사항, 논의 포인트, or pending review items when the skill says so.\n"
-            "When the skill asks for follow-up rendering, image ideas, or other result post-processing, you may also return `postprocess_requests`.\n"
-            "`postprocess_requests` is optional. Use it only for concrete downstream result work such as image generation briefs, renderer follow-up notes, appendix suggestions, or already-prepared visual assets.\n"
-            "If the final result should contain multiple related visuals, either emit one image request per visual or set `count` on an image request.\n"
-            "If an image asset is already available, you may include `caption` and `image_path` with that request.\n"
-            "When the skill implies where a visual belongs in the final PDF, preserve that wording in `placement_notes` and include `target_heading` whenever the current result gives you a concrete anchor.\n"
+            "Finish the text briefing first during this step.\n"
+            "Do not plan generated images, visual appendix items, or other visual follow-up work while writing the text briefing.\n"
+            "`postprocess_requests` is optional at this stage. Use it only for non-visual downstream result work that must survive into final export.\n"
+            "Do not emit image briefs, image ideas, visual appendix plans, or other generated-visual requests in `postprocess_requests` during this step.\n"
             "Do not compress a long or conceptually dense meeting into too few sections or too few sentences just to fit a neat short template.\n"
             "When the meeting is explanatory, lecture-like, or strategy-heavy, the sections may read like interpretive briefing notes rather than a bare chronology.\n"
             "Every section must include concrete `timestamp_refs` drawn from the session evidence.\n"
             "Do not return an empty `timestamp_refs` array for a real section; if the evidence is broad, choose the closest 1 to 4 supporting clock labels.\n"
             "If the skill conflicts with the required JSON keys or schema, the schema wins.\n\n"
-            f"{self._meeting_output_skill_prompt_block()}"
+            f"{self._meeting_output_summary_skill_prompt_block()}"
             f"Session payload:\n{self._session_context_json(session, recent_only=False)}"
         )
         parsed = self._codex_json_response(
@@ -610,6 +717,11 @@ class AiDelegateClient:
         postprocess_requests = parsed.get("postprocess_requests")
         if not isinstance(postprocess_requests, list):
             postprocess_requests = []
+        cleaned_postprocess_requests = [
+            item
+            for item in self._clean_result_generation_requests(postprocess_requests)
+            if str(item.get("kind") or "").strip().lower() != "image_brief"
+        ]
         sections = parsed.get("sections")
         if not isinstance(sections, list):
             sections = []
@@ -626,25 +738,7 @@ class AiDelegateClient:
             "decisions": [str(item).strip() for item in decisions if str(item).strip()],
             "open_questions": [str(item).strip() for item in open_questions if str(item).strip()],
             "risk_signals": [str(item).strip() for item in risk_signals if str(item).strip()],
-            "postprocess_requests": [
-                {
-                    "kind": str(item.get("kind") or "").strip(),
-                    "title": str(item.get("title") or "").strip(),
-                    "instruction": str(item.get("instruction") or "").strip(),
-                    "prompt": str(item.get("prompt") or "").strip(),
-                    "tool_hint": str(item.get("tool_hint") or "").strip(),
-                    "caption": str(item.get("caption") or "").strip(),
-                    "image_path": str(item.get("image_path") or "").strip(),
-                    "count": str(self._coerce_positive_count(item.get("count"), default=1)),
-                    "placement_notes": str(item.get("placement_notes") or ""),
-                    "target_heading": str(item.get("target_heading") or ""),
-                }
-                for item in postprocess_requests
-                if isinstance(item, dict)
-                and str(item.get("kind") or "").strip()
-                and str(item.get("title") or "").strip()
-                and str(item.get("instruction") or "").strip()
-            ],
+            "postprocess_requests": cleaned_postprocess_requests,
             "sections": [
                 {
                     "heading": str(item.get("heading") or "").strip(),
@@ -873,6 +967,65 @@ class AiDelegateClient:
         if not parts:
             return ""
         return "\n".join(parts)
+
+    def _is_visual_postprocess_text(self, text: str) -> bool:
+        lowered = str(text or "").strip().casefold()
+        if not lowered:
+            return False
+        return any(keyword in lowered for keyword in SUMMARY_STAGE_VISUAL_KEYWORDS)
+
+    def _strip_visual_postprocess_guidance(self, text: str) -> str:
+        lines = str(text or "").splitlines()
+        filtered: list[str] = []
+        skip_heading_level: int | None = None
+        for line in lines:
+            stripped = line.strip()
+            heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if skip_heading_level is not None:
+                if heading_match and len(heading_match.group(1)) <= skip_heading_level:
+                    skip_heading_level = None
+                else:
+                    continue
+            if heading_match:
+                heading_level = len(heading_match.group(1))
+                heading_text = heading_match.group(2).strip()
+                if self._is_visual_postprocess_text(heading_text):
+                    skip_heading_level = heading_level
+                    continue
+            if stripped and self._is_visual_postprocess_text(stripped):
+                continue
+            filtered.append(line)
+        return "\n".join(filtered).strip()
+
+    def _summary_stage_skill_metadata(self, metadata: dict[str, Any]) -> dict[str, str]:
+        filtered: dict[str, str] = {}
+        for raw_key, raw_value in dict(metadata or {}).items():
+            key = str(raw_key or "").strip()
+            value = str(raw_value or "").strip()
+            if not key or not value:
+                continue
+            if key in SUMMARY_STAGE_EXCLUDED_METADATA_KEYS:
+                continue
+            if key == "result_block_order":
+                order = [item.strip() for item in value.split(",") if item.strip()]
+                order = [item for item in order if item != "postprocess_requests"]
+                if not order:
+                    continue
+                filtered[key] = ", ".join(order)
+                continue
+            filtered[key] = value
+        return filtered
+
+    def _summary_stage_skill_state(self, skill: dict[str, object] | None) -> dict[str, object]:
+        state = dict(skill or {})
+        description = str(state.get("description") or "").strip()
+        return {
+            "name": str(state.get("name") or "").strip(),
+            "resolved_path": str(state.get("resolved_path") or state.get("path") or "").strip(),
+            "description": "" if self._is_visual_postprocess_text(description) else description,
+            "metadata": self._summary_stage_skill_metadata(dict(state.get("metadata") or {})),
+            "body": self._strip_visual_postprocess_guidance(str(state.get("body") or "")),
+        }
 
     def _resolve_renderer_theme_with_codex(
         self,
@@ -1373,6 +1526,7 @@ class AiDelegateClient:
         title: str,
         context_result: dict[str, Any],
         progress_callback: Callable[[str, str, str | None], None] | None = None,
+        timing_entries: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         visuals_dir = output_dir / "visuals"
         visuals_dir.mkdir(parents=True, exist_ok=True)
@@ -1400,6 +1554,15 @@ class AiDelegateClient:
             if not should_generate_image:
                 materialized.append(dict(item))
                 continue
+            request_started_at = self._now_iso()
+            request_perf = time.perf_counter()
+            request_timing: dict[str, Any] = {
+                "title": str(item.get("title") or "").strip(),
+                "target_heading": str(item.get("target_heading") or "").strip(),
+                "requested_count": count,
+                "started_at": request_started_at,
+                "attempts": [],
+            }
             image_request_index += 1
             if progress_callback is not None:
                 title_text = str(item.get("title") or "").strip()
@@ -1411,22 +1574,30 @@ class AiDelegateClient:
                     "이미지를 만드는 중입니다.",
                     detail,
                 )
+            preparation_perf = time.perf_counter()
             prepared_request = self._enrich_result_image_request(
                 session,
                 title=title,
                 request=dict(item),
                 context_result=context_result,
             )
+            request_timing["preparation_seconds"] = round(max(time.perf_counter() - preparation_perf, 0.0), 3)
             approved_paths: list[Path] = []
             review_failures: list[dict[str, str]] = []
             review_feedback = str(prepared_request.get("review_feedback") or "").strip()
             last_generation_error = ""
-            for _attempt_index in range(self._result_image_review_attempts):
+            for attempt_index in range(self._result_image_review_attempts):
+                attempt_started_at = self._now_iso()
+                attempt_timing: dict[str, Any] = {
+                    "attempt_index": attempt_index + 1,
+                    "started_at": attempt_started_at,
+                }
                 attempt_request = dict(prepared_request)
                 if review_feedback:
                     attempt_request["review_feedback"] = review_feedback
                 else:
                     attempt_request["review_feedback"] = ""
+                generate_perf = time.perf_counter()
                 try:
                     generated_paths = await self._generate_result_images(
                         session,
@@ -1436,13 +1607,25 @@ class AiDelegateClient:
                         output_dir=visuals_dir,
                         rendering_policy=policy,
                     )
+                    attempt_timing["generate_seconds"] = round(max(time.perf_counter() - generate_perf, 0.0), 3)
+                    attempt_timing["generated_candidate_count"] = len(generated_paths)
                 except Exception as exc:
+                    attempt_timing["generate_seconds"] = round(max(time.perf_counter() - generate_perf, 0.0), 3)
+                    attempt_timing["generation_error"] = str(exc).strip() or exc.__class__.__name__
+                    attempt_timing["finished_at"] = self._now_iso()
+                    request_timing["attempts"].append(attempt_timing)
                     last_generation_error = str(exc).strip() or exc.__class__.__name__
                     review_failures = []
                     break
                 if not generated_paths:
+                    attempt_timing["review_seconds"] = 0.0
+                    attempt_timing["approved_count"] = 0
+                    attempt_timing["review_failure_count"] = 0
+                    attempt_timing["finished_at"] = self._now_iso()
+                    request_timing["attempts"].append(attempt_timing)
                     review_failures = []
                     break
+                review_perf = time.perf_counter()
                 approved_paths, review_failures = await self._review_result_image_candidates(
                     session,
                     title=title,
@@ -1450,6 +1633,11 @@ class AiDelegateClient:
                     context_result=context_result,
                     candidate_paths=generated_paths,
                 )
+                attempt_timing["review_seconds"] = round(max(time.perf_counter() - review_perf, 0.0), 3)
+                attempt_timing["approved_count"] = len(approved_paths)
+                attempt_timing["review_failure_count"] = len(review_failures)
+                attempt_timing["finished_at"] = self._now_iso()
+                request_timing["attempts"].append(attempt_timing)
                 if approved_paths:
                     prepared_request = dict(attempt_request)
                     prepared_request["review_status"] = "approved"
@@ -1461,6 +1649,13 @@ class AiDelegateClient:
                 note = review_feedback or last_generation_error or "The generated image did not pass review."
                 prepared_request["review_status"] = "rejected"
                 prepared_request["review_note"] = note
+                request_timing["status"] = "rejected"
+                request_timing["approved_count"] = 0
+                request_timing["review_note"] = note
+                request_timing["finished_at"] = self._now_iso()
+                request_timing["elapsed_seconds"] = round(max(time.perf_counter() - request_perf, 0.0), 3)
+                if timing_entries is not None:
+                    timing_entries.append(request_timing)
                 errors.append(
                     {
                         "title": str(item.get("title") or "").strip(),
@@ -1470,6 +1665,12 @@ class AiDelegateClient:
                 materialized.append(prepared_request)
                 continue
             final_count = len(final_paths)
+            request_timing["status"] = "approved"
+            request_timing["approved_count"] = final_count
+            request_timing["finished_at"] = self._now_iso()
+            request_timing["elapsed_seconds"] = round(max(time.perf_counter() - request_perf, 0.0), 3)
+            if timing_entries is not None:
+                timing_entries.append(request_timing)
             for index, path in enumerate(final_paths, start=1):
                 cloned = dict(prepared_request)
                 # Generated visuals are treated as complete artifacts now.
@@ -2297,6 +2498,41 @@ class AiDelegateClient:
             return ""
         return "\n\n".join(lines) + "\n\n"
 
+    def _meeting_output_summary_skill_prompt_block(self) -> str:
+        lines: list[str] = []
+        base_block = self._one_skill_prompt_block(
+            label="Base result-generation skill",
+            skill=self._summary_stage_skill_state(self._meeting_output_skill),
+            fallback_body=(
+                "# Meeting Output Summary Fallback\n\n"
+                "- Stay inside the fixed engine and JSON schema.\n"
+                "- Treat the JSON keys as internal transport slots rather than rigid user-facing labels.\n"
+                "- Write polished Korean meeting output grounded in the actual session.\n"
+                "- Preserve concrete details when the meeting supports them.\n"
+            ),
+        )
+        if base_block:
+            lines.append(base_block)
+        generated_block = self._one_skill_prompt_block(
+            label="Generated result-generation skill",
+            skill=self._summary_stage_skill_state(self._generated_meeting_output_skill),
+        )
+        if generated_block:
+            lines.append(generated_block)
+        elif str(self._meeting_output_customization or "").strip():
+            filtered_customization = self._strip_visual_postprocess_guidance(
+                str(self._meeting_output_customization or "").strip()
+            )
+            if filtered_customization:
+                lines.append(
+                    "User result-generation intent:\n"
+                    "- The following natural-language preference could not be expanded into a generated skill file yet.\n\n"
+                    + filtered_customization
+                )
+        if not lines:
+            return ""
+        return "\n\n".join(lines) + "\n\n"
+
     def _generated_meeting_output_prompt_block(self) -> str:
         if not self._generated_meeting_output_skill:
             return ""
@@ -2777,6 +3013,34 @@ class AiDelegateClient:
             "cwd": cwd or str(self._codex_workdir),
             "source": source,
         }
+
+    def _ensure_performance_timing_root(self, session: DelegateSession) -> dict[str, Any]:
+        timing_root = dict(session.ai_state.get("performance_timing") or {})
+        session.ai_state["performance_timing"] = timing_root
+        return timing_root
+
+    def _begin_result_generation_timing(
+        self,
+        session: DelegateSession,
+        *,
+        started_at: str,
+        request_count: int,
+        non_image_request_count: int,
+    ) -> dict[str, Any]:
+        timing_root = self._ensure_performance_timing_root(session)
+        bucket: dict[str, Any] = {
+            "started_at": started_at,
+            "status": "running",
+            "request_count": request_count,
+            "non_image_request_count": non_image_request_count,
+            "requests": [],
+            "updated_at": started_at,
+        }
+        timing_root["result_generation"] = bucket
+        return bucket
+
+    def _now_iso(self) -> str:
+        return utcnow_iso()
 
     def _parse_result_image_mcp_args(self, raw_text: str) -> list[str]:
         text = str(raw_text or "").strip()

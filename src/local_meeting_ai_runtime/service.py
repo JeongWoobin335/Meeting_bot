@@ -12,7 +12,9 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import sys
 import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -94,6 +96,12 @@ class DelegateService:
         self._continuous_audio_silence_ms = max(self._env_int("DELEGATE_CONTINUOUS_AUDIO_SILENCE_MS", 650), 100)
         self._continuous_audio_min_segment_ms = max(self._env_int("DELEGATE_CONTINUOUS_AUDIO_MIN_SEGMENT_MS", 450), 100)
         self._continuous_audio_queue_size = max(self._env_int("DELEGATE_CONTINUOUS_AUDIO_QUEUE_SIZE", 32), 4)
+        self._continuous_full_track_capture = self._env_bool("DELEGATE_CONTINUOUS_FULL_TRACK_CAPTURE", True)
+        self._continuous_full_track_chunk_seconds = max(
+            self._env_float("DELEGATE_CONTINUOUS_FULL_TRACK_CHUNK_SECONDS", 45.0),
+            5.0,
+        )
+        self._windows_audio_helper_backend = self._env_bool("DELEGATE_WINDOWS_AUDIO_HELPER_BACKEND", True)
         self._session_heartbeat_timeout_seconds = max(
             self._env_float("DELEGATE_SESSION_HEARTBEAT_TIMEOUT_SECONDS", 90.0),
             5.0,
@@ -850,12 +858,34 @@ class DelegateService:
             prepared_payload = self._prepare_conversation_capture_payload(prepared_payload)
         metadata = dict(payload.get("metadata") or {})
         metadata.setdefault("capture_profile", "continuous_audio_observer")
+        use_windows_native_helper = bool(
+            sys.platform == "win32"
+            and audio_mode == "conversation"
+            and self._continuous_conversation_live
+        )
+        if use_windows_native_helper and not self._observer.windows_audio_capture_available():
+            raise LocalObserverError("Windows native audio helper is not available for continuous conversation capture.")
         control = {
             "stop_requested": False,
             "seconds": seconds,
             "interval_ms": interval_ms,
             "audio_mode": audio_mode,
             "continuous_mode": bool(audio_mode == "conversation" and self._continuous_conversation_live),
+            "full_track_enabled": bool(
+                audio_mode == "conversation"
+                and self._continuous_conversation_live
+                and self._continuous_full_track_capture
+            ),
+            "capture_backend": (
+                "windows_native_helper"
+                if use_windows_native_helper
+                else "soundcard"
+            ),
+            "full_track_chunk_seconds": (
+                self._continuous_full_track_chunk_seconds
+                if audio_mode == "conversation"
+                else None
+            ),
             "frame_ms": self._continuous_audio_frame_ms if audio_mode == "conversation" else None,
             "silence_ms": self._continuous_audio_silence_ms if audio_mode == "conversation" else None,
             "metadata": metadata,
@@ -876,10 +906,26 @@ class DelegateService:
             "interval_ms": interval_ms,
             "audio_mode": audio_mode,
             "continuous_mode": bool(control["continuous_mode"]),
+            "full_track_enabled": bool(control["full_track_enabled"]),
+            "capture_backend": str(control.get("capture_backend") or "soundcard"),
+            "full_track_chunk_seconds": control.get("full_track_chunk_seconds"),
             "frame_ms": control.get("frame_ms"),
             "silence_ms": control.get("silence_ms"),
             "started_at": control["started_at"],
         }
+        if bool(control.get("full_track_enabled")):
+            session.ai_state["full_track_capture"] = {
+                "running": True,
+                "strategy": (
+                    "windows_native_full_track"
+                    if str(control.get("capture_backend") or "") == "windows_native_helper"
+                    else "rolling_full_track"
+                ),
+                "chunk_seconds": float(control.get("full_track_chunk_seconds") or 0.0),
+                "started_at": control["started_at"],
+                "chunks": 0,
+            }
+            session.ai_state.setdefault("full_track_capture_baseline", control["started_at"])
         self._reactivate_session(
             session,
             reason="Continuous meeting audio observation started.",
@@ -890,7 +936,10 @@ class DelegateService:
         async def runner() -> None:
             if bool(control.get("continuous_mode")):
                 try:
-                    await self._run_continuous_conversation_observer(session_id, control)
+                    if str(control.get("capture_backend") or "") == "windows_native_helper":
+                        await self._run_windows_native_conversation_observer(session_id, control)
+                    else:
+                        await self._run_continuous_conversation_observer(session_id, control)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -982,6 +1031,9 @@ class DelegateService:
             "interval_ms": control.get("interval_ms"),
             "audio_mode": control.get("audio_mode"),
             "continuous_mode": bool(control.get("continuous_mode")),
+            "full_track_enabled": bool(control.get("full_track_enabled")),
+            "capture_backend": control.get("capture_backend"),
+            "full_track_chunk_seconds": control.get("full_track_chunk_seconds"),
             "frame_ms": control.get("frame_ms"),
             "silence_ms": control.get("silence_ms"),
             "started_at": control.get("started_at"),
@@ -1002,11 +1054,192 @@ class DelegateService:
                 **dict(latest_session.ai_state.get("audio_observer") or {}),
                 "running": False,
                 "stopped_at": utcnow_iso(),
+                "capture_backend": (control or {}).get("capture_backend"),
                 "cycles": int((control or {}).get("cycles") or 0),
                 "last_error": (control or {}).get("last_error"),
                 "last_result": dict((control or {}).get("last_result") or {}),
             }
+            if dict(latest_session.ai_state.get("full_track_capture") or {}):
+                full_track_state = {
+                    **dict(latest_session.ai_state.get("full_track_capture") or {}),
+                    "running": False,
+                    "stopped_at": utcnow_iso(),
+                }
+                latest_session.ai_state["full_track_capture"] = full_track_state
             self.persist_session(latest_session)
+
+    def _windows_audio_helper_dir(self, session_id: str) -> Path:
+        path = Path(self._observer._artifact_dir) / f"windows-audio-helper-{session_id}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _build_windows_full_track_observation(
+        self,
+        *,
+        path: str | Path,
+        source: str,
+        capture_mode: str,
+        sample_rate: int,
+        seconds: float,
+        channels: int,
+        device_name: str | None,
+        captured_at: str,
+    ) -> dict[str, Any]:
+        normalized_path = Path(path)
+        return {
+            "filename": normalized_path.name,
+            "sample_rate": int(sample_rate),
+            "seconds": max(float(seconds), 0.0),
+            "artifact_path": str(normalized_path),
+            "capture_mode": capture_mode,
+            "audio_source": source,
+            "audio_channels": max(int(channels), 1),
+            "channel_layout": "stereo" if int(channels) >= 2 else "mono",
+            "device_name": str(device_name or ""),
+            "captured_at": captured_at,
+            "audio_rms": 0.0,
+            "audio_peak": 0.0,
+            "below_rms_threshold": False,
+        }
+
+    async def _run_windows_native_conversation_observer(self, session_id: str, control: dict[str, Any]) -> None:
+        helper_dir = self._windows_audio_helper_dir(session_id)
+        microphone_output_path = helper_dir / "microphone-full-track.wav"
+        system_output_path = helper_dir / "system-full-track.wav"
+        manifest_path = helper_dir / "capture-manifest.json"
+        log_path = helper_dir / "capture.log"
+        helper_command = self._observer.ensure_windows_audio_helper_command()
+        payload = dict(control.get("payload") or {})
+        microphone_device_name = str(
+            payload.get("microphone_device_name") or payload.get("device_name") or ""
+        ).strip()
+        system_device_name = str(
+            payload.get("system_device_name")
+            or payload.get("meeting_output_device_name")
+            or payload.get("device_name")
+            or ""
+        ).strip()
+        helper_args = [
+            *helper_command,
+            "record",
+            "--microphone-output",
+            str(microphone_output_path),
+            "--system-output",
+            str(system_output_path),
+            "--manifest-path",
+            str(manifest_path),
+            "--log-path",
+            str(log_path),
+        ]
+        if microphone_device_name:
+            helper_args.extend(["--microphone-device", microphone_device_name])
+        if system_device_name:
+            helper_args.extend(["--speaker-device", system_device_name])
+
+        process = await asyncio.create_subprocess_exec(
+            *helper_args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        control["helper_pid"] = process.pid
+        control["helper_manifest_path"] = str(manifest_path)
+        control["helper_log_path"] = str(log_path)
+
+        try:
+            while True:
+                if control.get("stop_requested"):
+                    if process.stdin is not None and not process.stdin.is_closing():
+                        process.stdin.close()
+                        try:
+                            await process.stdin.wait_closed()
+                        except Exception:
+                            pass
+                    break
+                if process.returncode is not None:
+                    break
+                await asyncio.sleep(0.5)
+
+            try:
+                exit_code = await asyncio.wait_for(process.wait(), timeout=20.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                exit_code = await process.wait()
+
+            if exit_code != 0:
+                tail = self._observer.tail_text_file(log_path)
+                raise LocalObserverError(
+                    "Windows audio helper capture failed."
+                    + (f"\n{tail}" if tail else "")
+                )
+
+            if not manifest_path.exists():
+                raise LocalObserverError("Windows audio helper finished without writing a capture manifest.")
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            microphone_track = dict(manifest.get("microphone") or {})
+            system_track = dict(manifest.get("system") or {})
+            captured_at = str(manifest.get("stopped_at") or utcnow_iso()).strip() or utcnow_iso()
+            if not microphone_track.get("path") or not system_track.get("path"):
+                raise LocalObserverError("Windows audio helper manifest did not include both microphone and system tracks.")
+
+            observed_session = self._require_session(session_id)
+            observed_session = self._process_full_track_observations(
+                observed_session,
+                microphone_observation=self._build_windows_full_track_observation(
+                    path=microphone_track.get("path"),
+                    source="microphone",
+                    capture_mode="full_track_microphone",
+                    sample_rate=int(microphone_track.get("sample_rate") or self._observer._audio_sample_rate),
+                    seconds=float(microphone_track.get("seconds") or 0.0),
+                    channels=int(microphone_track.get("channels") or 1),
+                    device_name=str(microphone_track.get("device_name") or microphone_device_name),
+                    captured_at=captured_at,
+                ),
+                system_observation=self._build_windows_full_track_observation(
+                    path=system_track.get("path"),
+                    source="system",
+                    capture_mode="full_track_system_audio",
+                    sample_rate=int(system_track.get("sample_rate") or self._observer._audio_sample_rate),
+                    seconds=float(system_track.get("seconds") or 0.0),
+                    channels=int(system_track.get("channels") or 1),
+                    device_name=str(system_track.get("device_name") or system_device_name),
+                    captured_at=captured_at,
+                ),
+            )
+            observed_session.ai_state["full_track_capture"] = {
+                **dict(observed_session.ai_state.get("full_track_capture") or {}),
+                "running": True,
+                "strategy": "windows_native_full_track",
+                "chunks": 1,
+                "last_archived_at": captured_at,
+                "helper_log_path": str(log_path),
+                "manifest_path": str(manifest_path),
+            }
+            control["cycles"] = int(control.get("cycles") or 0) + 1
+            control["last_result"] = {
+                "transcript_lines": 0,
+                "capture_mode": "windows_native_full_track",
+                "captured_at": captured_at,
+                "seconds": max(
+                    float(microphone_track.get("seconds") or 0.0),
+                    float(system_track.get("seconds") or 0.0),
+                ),
+            }
+            control["last_error"] = None
+            observed_session.ai_state["audio_observer"] = {
+                **dict(observed_session.ai_state.get("audio_observer") or {}),
+                "running": True,
+                "capture_backend": "windows_native_helper",
+                "cycles": control["cycles"],
+                "last_result": dict(control["last_result"]),
+                "helper_log_path": str(log_path),
+            }
+            self.persist_session(observed_session)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
 
     async def _run_continuous_conversation_observer(self, session_id: str, control: dict[str, Any]) -> None:
         capture_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -1036,6 +1269,36 @@ class DelegateService:
                 item_type = str(item.get("type") or "").strip().lower()
                 if item_type == "error":
                     raise LocalObserverError(str(item.get("error") or "Continuous conversation capture failed."))
+                if item_type == "full_track_observation":
+                    session = self._require_session(session_id)
+                    observed_session = self._process_full_track_observations(
+                        session,
+                        microphone_observation=dict(item.get("microphone_observation") or {}),
+                        system_observation=dict(item.get("system_observation") or {}),
+                    )
+                    full_track_archives = self._sorted_audio_archives(
+                        observed_session,
+                        archive_key="full_track_archive_paths",
+                    )
+                    full_track_chunk_count = len(
+                        [
+                            item
+                            for item in full_track_archives
+                            if str(item.get("audio_source") or "").strip().lower() == "microphone"
+                        ]
+                    )
+                    observed_session.ai_state["full_track_capture"] = {
+                        **dict(observed_session.ai_state.get("full_track_capture") or {}),
+                        "running": True,
+                        "strategy": "rolling_full_track",
+                        "chunk_seconds": float(control.get("full_track_chunk_seconds") or 0.0),
+                        "chunks": full_track_chunk_count,
+                        "last_archived_at": utcnow_iso(),
+                    }
+                    observed_session = self.persist_session(observed_session)
+                    if not worker.is_alive() and capture_queue.empty():
+                        break
+                    continue
                 if item_type != "observation":
                     if stop_event.is_set() and not worker.is_alive():
                         break
@@ -1100,9 +1363,12 @@ class DelegateService:
             max_segment_frames = max(int(rate * max_segment_seconds), frame_count)
             threshold = float(self._observer._audio_rms_threshold)
             recorder_blocksize = max(
-                int(rate * (float(getattr(self._observer, "_audio_blocksize_ms", 1200)) / 1000.0)),
-                frame_count * 2,
+                int(rate * (float(getattr(self._observer, "_audio_blocksize_ms", 300)) / 1000.0)),
+                frame_count,
             )
+            full_track_enabled = bool(control.get("full_track_enabled"))
+            full_track_chunk_seconds = max(float(control.get("full_track_chunk_seconds") or 0.0), 5.0)
+            full_track_frames_limit = max(int(rate * full_track_chunk_seconds), frame_count)
 
             microphone_device_name = str(
                 payload.get("microphone_device_name") or payload.get("device_name") or ""
@@ -1123,13 +1389,17 @@ class DelegateService:
             active_frames = 0
             trailing_silence_frames = 0
             segment_counter = 0
+            full_track_microphone: list[Any] = []
+            full_track_system: list[Any] = []
+            full_track_frames = 0
+            full_track_counter = 0
             microphone_chunk_queue: queue.Queue[Any] = queue.Queue(maxsize=self._continuous_audio_queue_size)
             system_chunk_queue: queue.Queue[Any] = queue.Queue(maxsize=self._continuous_audio_queue_size)
 
             def normalize_samples(raw: Any) -> Any:
                 audio = raw
                 if getattr(audio, "ndim", 1) > 1:
-                    audio = audio[:, 0]
+                    audio = audio.astype("float32", copy=False).mean(axis=1)
                 return audio.astype("float32", copy=False)
 
             def publish_chunk(target_queue: queue.Queue[Any], chunk: Any) -> None:
@@ -1197,11 +1467,57 @@ class DelegateService:
                 )
                 reset_active()
 
+            def flush_full_track() -> None:
+                nonlocal full_track_counter, full_track_microphone, full_track_system, full_track_frames
+                if not full_track_enabled or full_track_frames <= 0 or not full_track_microphone or not full_track_system:
+                    full_track_microphone = []
+                    full_track_system = []
+                    full_track_frames = 0
+                    return
+                microphone_audio = self._concatenate_audio_chunks(full_track_microphone)
+                system_audio = self._concatenate_audio_chunks(full_track_system)
+                if microphone_audio is None or system_audio is None:
+                    full_track_microphone = []
+                    full_track_system = []
+                    full_track_frames = 0
+                    return
+                full_track_counter += 1
+                captured_at = utcnow_iso()
+                microphone_observation = self._build_audio_observation_from_samples(
+                    microphone_audio,
+                    sample_rate=rate,
+                    source="microphone",
+                    capture_mode="full_track_microphone",
+                    filename=f"microphone-full-track-{full_track_counter}.wav",
+                    device_name=str(getattr(microphone_device, "name", "") or microphone_device_name or ""),
+                    persist_artifact=False,
+                )
+                microphone_observation["captured_at"] = captured_at
+                system_observation = self._build_audio_observation_from_samples(
+                    system_audio,
+                    sample_rate=rate,
+                    source="system",
+                    capture_mode="full_track_system_audio",
+                    filename=f"system-full-track-{full_track_counter}.wav",
+                    device_name=str(getattr(speaker, "name", "") or system_device_name or ""),
+                    persist_artifact=False,
+                )
+                system_observation["captured_at"] = captured_at
+                capture_queue.put(
+                    {
+                        "type": "full_track_observation",
+                        "microphone_observation": microphone_observation,
+                        "system_observation": system_observation,
+                    }
+                )
+                full_track_microphone = []
+                full_track_system = []
+                full_track_frames = 0
+
             def recorder_loop(*, recorder_device: Any, target_queue: queue.Queue[Any], label: str) -> None:
                 try:
                     with recorder_device.recorder(
                         samplerate=rate,
-                        channels=1,
                         blocksize=recorder_blocksize,
                     ) as recorder:
                         while not stop_event.is_set():
@@ -1249,6 +1565,13 @@ class DelegateService:
                             break
                         continue
 
+                    if full_track_enabled:
+                        full_track_microphone.append(microphone_chunk)
+                        full_track_system.append(system_chunk)
+                        full_track_frames += len(microphone_chunk)
+                        if full_track_frames >= full_track_frames_limit:
+                            flush_full_track()
+
                     microphone_rms = float(
                         (microphone_chunk.astype("float32") ** 2).mean() ** 0.5
                     ) if len(microphone_chunk) else 0.0
@@ -1289,6 +1612,7 @@ class DelegateService:
                 microphone_reader.join(timeout=1.0)
                 system_reader.join(timeout=1.0)
                 flush_segment()
+                flush_full_track()
         except Exception as exc:
             capture_queue.put({"type": "error", "error": str(exc)})
 
@@ -1301,6 +1625,7 @@ class DelegateService:
         capture_mode: str,
         filename: str,
         device_name: str | None,
+        persist_artifact: bool = True,
     ) -> dict[str, Any]:
         if importlib.util.find_spec("soundfile") is None:
             raise RuntimeError("soundfile is required to package captured audio samples.")
@@ -1319,14 +1644,16 @@ class DelegateService:
         buffer = io.BytesIO()
         sf.write(buffer, normalized, int(sample_rate), format="WAV")
         wav_bytes = buffer.getvalue()
-        artifact_path = Path(self._observer._artifact_dir) / filename
-        artifact_path.write_bytes(wav_bytes)
+        artifact_path: Path | None = None
+        if persist_artifact:
+            artifact_path = Path(self._observer._artifact_dir) / filename
+            artifact_path.write_bytes(wav_bytes)
         return {
             "audio_bytes": wav_bytes,
             "filename": filename,
             "sample_rate": int(sample_rate),
             "seconds": duration,
-            "artifact_path": str(artifact_path),
+            "artifact_path": None if artifact_path is None else str(artifact_path),
             "capture_mode": capture_mode,
             "audio_source": source,
             "audio_channels": channel_count,
@@ -1346,6 +1673,50 @@ class DelegateService:
         if not arrays:
             return None
         return np.concatenate(arrays, axis=0).astype("float32", copy=False)
+
+    def _process_full_track_observations(
+        self,
+        session: DelegateSession,
+        *,
+        microphone_observation: dict[str, Any],
+        system_observation: dict[str, Any],
+    ) -> DelegateSession:
+        microphone_archived_path = self._archive_audio_observation(
+            session,
+            microphone_observation,
+            archive_key="full_track_archive_paths",
+            baseline_key="full_track_capture_baseline",
+        )
+        if microphone_archived_path:
+            microphone_observation["archived_path"] = microphone_archived_path
+        microphone_observation.pop("audio_bytes", None)
+        system_archived_path = self._archive_audio_observation(
+            session,
+            system_observation,
+            archive_key="full_track_archive_paths",
+            baseline_key="full_track_capture_baseline",
+        )
+        if system_archived_path:
+            system_observation["archived_path"] = system_archived_path
+        system_observation.pop("audio_bytes", None)
+        archives = self._sorted_audio_archives(session, archive_key="full_track_archive_paths")
+        chunk_count = len(
+            [
+                item
+                for item in archives
+                if str(item.get("audio_source") or "").strip().lower() == "microphone"
+            ]
+        )
+        session.ai_state["full_track_capture"] = {
+            **dict(session.ai_state.get("full_track_capture") or {}),
+            "running": True,
+            "strategy": "rolling_full_track",
+            "chunks": chunk_count,
+            "last_archived_at": utcnow_iso(),
+            "microphone_last_archived_path": microphone_archived_path,
+            "system_last_archived_path": system_archived_path,
+        }
+        return session
 
     async def _process_captured_conversation_observations(
         self,
@@ -1559,6 +1930,9 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             return session
+        pipeline_started_at = utcnow_iso()
+        pipeline_perf = time.perf_counter()
+        self._begin_completion_timing(session, started_at=pipeline_started_at)
         self._set_user_progress(
             session,
             stage="meeting_ended",
@@ -1596,10 +1970,21 @@ class DelegateService:
                 detail="회의 내용을 더 정확하게 정리하기 위한 마지막 확인 단계입니다.",
             )
             session = self.persist_session(session)
+            transcription_started_at = utcnow_iso()
+            transcription_perf = time.perf_counter()
             try:
                 session = await self._refresh_transcript_from_audio_archive(session)
             except Exception as exc:
                 failure_reason = str(exc).strip() or "Final transcription quality pass failed."
+                self._record_completion_timing(
+                    session,
+                    "final_transcription_refresh",
+                    elapsed_seconds=time.perf_counter() - transcription_perf,
+                    started_at=transcription_started_at,
+                    finished_at=utcnow_iso(),
+                    status="failed",
+                    reason=failure_reason,
+                )
                 session.ai_state["final_transcription"] = {
                     "status": "failed",
                     "provider": str(self._ai.quality_readiness().get("provider") or "faster_whisper_cuda"),
@@ -1624,10 +2009,29 @@ class DelegateService:
                         message="회의 내용을 정리할 수 없었습니다.",
                         detail="수집된 회의 내용이 충분하지 않았습니다.",
                     )
+                    self._finalize_completion_timing(
+                        session,
+                        started_at=pipeline_started_at,
+                        pipeline_started_perf=pipeline_perf,
+                        status="failed",
+                    )
                     return self.persist_session(session)
                 session.status_reason = (
                     "Final offline transcription failed, so the exported summary used the current live meeting capture. "
                     + failure_reason
+                )
+            else:
+                final_state = dict(session.ai_state.get("final_transcription") or {})
+                self._record_completion_timing(
+                    session,
+                    "final_transcription_refresh",
+                    elapsed_seconds=time.perf_counter() - transcription_perf,
+                    started_at=transcription_started_at,
+                    finished_at=utcnow_iso(),
+                    status=str(final_state.get("status") or "success").strip() or "success",
+                    provider=str(final_state.get("provider") or "").strip() or None,
+                    model=str(final_state.get("model") or "").strip() or None,
+                    diarization_provider=str(final_state.get("diarization_provider") or "").strip() or None,
                 )
         else:
             session.ai_state["final_transcription"] = {
@@ -1641,11 +2045,30 @@ class DelegateService:
                 "readiness_snapshot": self.quality_readiness(),
                 "reason": "No archived audio was captured for this session.",
             }
+            self._record_completion_timing(
+                session,
+                "final_transcription_refresh",
+                elapsed_seconds=0.0,
+                started_at=utcnow_iso(),
+                finished_at=utcnow_iso(),
+                status="skipped",
+                reason="No archived audio was captured for this session.",
+            )
 
         session.status = "completed"
         if str(session.ai_state.get("final_transcription", {}).get("status") or "").strip().lower() == "success":
             session.status_reason = None
+        summary_packet_started_at = utcnow_iso()
+        summary_packet_perf = time.perf_counter()
         session.summary_packet = self._summary_pipeline.build(session)
+        self._record_completion_timing(
+            session,
+            "summary_packet_build",
+            elapsed_seconds=time.perf_counter() - summary_packet_perf,
+            started_at=summary_packet_started_at,
+            finished_at=utcnow_iso(),
+            status="success",
+        )
         self._set_user_progress(
             session,
             stage="summarizing",
@@ -1653,7 +2076,17 @@ class DelegateService:
             detail="회의 내용을 읽기 쉬운 형태로 정리하고 있습니다.",
         )
         session = self.persist_session(session)
+        summarize_started_at = utcnow_iso()
+        summarize_perf = time.perf_counter()
         ai_result = await self._ai.summarize_session(session)
+        self._record_completion_timing(
+            session,
+            "summarize_session",
+            elapsed_seconds=time.perf_counter() - summarize_perf,
+            started_at=summarize_started_at,
+            finished_at=utcnow_iso(),
+            status="success",
+        )
         self._set_user_progress(
             session,
             stage="result_preparation",
@@ -1661,6 +2094,8 @@ class DelegateService:
             detail="문서 구조와 필요한 시각 요소를 준비하고 있습니다.",
         )
         session = self.persist_session(session)
+        materialize_started_at = utcnow_iso()
+        materialize_perf = time.perf_counter()
         ai_result = await self._ai.materialize_result_generation(
             session,
             ai_result,
@@ -1670,6 +2105,20 @@ class DelegateService:
                 stage=stage,
                 message=message,
                 detail=detail,
+            ),
+        )
+        self._record_completion_timing(
+            session,
+            "result_materialization",
+            elapsed_seconds=time.perf_counter() - materialize_perf,
+            started_at=materialize_started_at,
+            finished_at=utcnow_iso(),
+            status="success",
+            image_request_count=int(
+                dict(
+                    dict(session.ai_state.get("performance_timing") or {}).get("result_generation") or {}
+                ).get("image_request_count")
+                or 0
             ),
         )
         session.summary = str(ai_result.get("summary") or "").strip()
@@ -1687,7 +2136,18 @@ class DelegateService:
             detail="마지막 형식을 정리하고 있습니다.",
         )
         session = self.persist_session(session)
+        export_started_at = utcnow_iso()
+        export_perf = time.perf_counter()
         self._write_exports(session)
+        self._record_completion_timing(
+            session,
+            "artifact_export",
+            elapsed_seconds=time.perf_counter() - export_perf,
+            started_at=export_started_at,
+            finished_at=utcnow_iso(),
+            status="failed" if str(session.ai_state.get("artifact_export_error") or "").strip() else "success",
+            export_count=len(session.summary_exports),
+        )
         if str(session.ai_state.get("artifact_export_error") or "").strip():
             self._set_user_progress(
                 session,
@@ -1702,6 +2162,14 @@ class DelegateService:
                 message="결과물이 준비되었습니다.",
                 detail="이제 결과물을 확인하실 수 있습니다.",
             )
+        self._finalize_completion_timing(
+            session,
+            started_at=pipeline_started_at,
+            pipeline_started_perf=pipeline_perf,
+            status="completed_with_export_error"
+            if str(session.ai_state.get("artifact_export_error") or "").strip()
+            else "completed",
+        )
         return self.persist_session(session)
 
     async def request_session_completion(
@@ -2686,19 +3154,30 @@ class DelegateService:
         return f"speaker_{match}"
 
     def _latest_audio_archive_at(self, session: DelegateSession) -> str | None:
-        archives = list(session.ai_state.get("audio_archive_paths") or [])
+        archives: list[dict[str, Any]] = []
+        for archive_key in ("audio_archive_paths", "full_track_archive_paths"):
+            archives.extend(
+                item
+                for item in list(session.ai_state.get(archive_key) or [])
+                if isinstance(item, dict)
+            )
         stamps = sorted(
             str(item.get("created_at") or "").strip()
             for item in archives
-            if isinstance(item, dict) and str(item.get("created_at") or "").strip()
+            if str(item.get("created_at") or "").strip()
         )
         return stamps[-1] if stamps else None
 
-    def _sorted_audio_archives(self, session: DelegateSession) -> list[dict[str, Any]]:
+    def _sorted_audio_archives(
+        self,
+        session: DelegateSession,
+        *,
+        archive_key: str = "audio_archive_paths",
+    ) -> list[dict[str, Any]]:
         return sorted(
             [
                 item
-                for item in list(session.ai_state.get("audio_archive_paths") or [])
+                for item in list(session.ai_state.get(archive_key) or [])
                 if isinstance(item, dict) and str(item.get("path") or "").strip() and Path(str(item.get("path"))).exists()
             ],
             key=lambda item: (
@@ -2764,21 +3243,30 @@ class DelegateService:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _archive_audio_observation(self, session: DelegateSession, observation: dict[str, Any]) -> str | None:
+    def _archive_audio_observation(
+        self,
+        session: DelegateSession,
+        observation: dict[str, Any],
+        *,
+        archive_key: str = "audio_archive_paths",
+        baseline_key: str = "audio_capture_baseline",
+    ) -> str | None:
         artifact_source = self._audio_observation_path(observation, include_archived=False)
         audio_bytes = observation.get("audio_bytes")
         if artifact_source is None and (not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes):
             return None
         source_name = str(observation.get("audio_source") or "audio").strip() or "audio"
-        archived_at = utcnow_iso()
+        archived_at = str(observation.get("captured_at") or observation.get("created_at") or utcnow_iso()).strip() or utcnow_iso()
+        if self._iso_to_timestamp(archived_at) is None:
+            archived_at = utcnow_iso()
         capture_seconds = max(float(observation.get("seconds") or 0.0), 0.0)
         archive_end_timestamp = self._iso_to_timestamp(archived_at) or 0.0
         archive_start_timestamp = max(archive_end_timestamp - capture_seconds, 0.0)
-        baseline = session.ai_state.get("audio_capture_baseline")
+        baseline = session.ai_state.get(baseline_key)
         baseline_timestamp = self._iso_to_timestamp(str(baseline or "")) if baseline else None
         if baseline_timestamp is None:
             baseline_timestamp = archive_start_timestamp
-            session.ai_state["audio_capture_baseline"] = datetime.fromtimestamp(
+            session.ai_state[baseline_key] = datetime.fromtimestamp(
                 baseline_timestamp,
             ).astimezone().isoformat()
         stamp = archived_at.replace(":", "").replace(".", "").replace("+00:00", "Z")
@@ -2787,7 +3275,7 @@ class DelegateService:
             shutil.copyfile(str(artifact_source), str(archive_path))
         else:
             archive_path.write_bytes(bytes(audio_bytes))
-        archives = list(session.ai_state.get("audio_archive_paths") or [])
+        archives = list(session.ai_state.get(archive_key) or [])
         capture_sequence = len(archives) + 1
         session_start_offset = round(max(archive_start_timestamp - baseline_timestamp, 0.0), 3)
         session_end_offset = round(max(archive_end_timestamp - baseline_timestamp, session_start_offset), 3)
@@ -2812,7 +3300,7 @@ class DelegateService:
                 "session_end_offset_seconds": session_end_offset,
             }
         )
-        session.ai_state["audio_archive_paths"] = archives
+        session.ai_state[archive_key] = archives
         observation["archived_at"] = archived_at
         observation["capture_sequence"] = capture_sequence
         observation["session_start_offset_seconds"] = session_start_offset
@@ -2992,7 +3480,11 @@ class DelegateService:
                 "meeting_output_path": merged_audio.get("meeting_output_path"),
                 "conversation_path": merged_audio.get("conversation_path"),
             },
-            "input_strategy": str(final_result.get("input_strategy") or "merged_tracks"),
+            "input_strategy": str(
+                final_result.get("input_strategy")
+                or merged_audio.get("archive_strategy")
+                or "merged_tracks"
+            ),
             "baseline_started_at": merged_audio.get("baseline_started_at"),
         }
         if final_result.get("fallback_reason"):
@@ -3000,13 +3492,36 @@ class DelegateService:
         return self.persist_session(session)
 
     def _merge_audio_archives_for_final_pass(self, session: DelegateSession) -> dict[str, Any]:
-        archives = self._sorted_audio_archives(session)
-        if not archives:
-            raise RuntimeError("No archived audio was available for the final transcription quality pass.")
-
         readiness = self.quality_readiness()
         if readiness["blocking_reasons"]:
             raise RuntimeError(" | ".join(str(item) for item in readiness["blocking_reasons"]))
+
+        archive_strategy = "segmented_audio_archive"
+        baseline_key = "audio_capture_baseline"
+        archives = self._sorted_audio_archives(session, archive_key="full_track_archive_paths")
+        if archives:
+            full_track_microphone = [
+                item
+                for item in archives
+                if str(item.get("audio_source") or "").strip().lower() == "microphone"
+            ]
+            full_track_system = [
+                item
+                for item in archives
+                if str(item.get("audio_source") or "").strip().lower() == "system"
+            ]
+            if full_track_microphone and full_track_system:
+                archive_strategy = str(
+                    dict(session.ai_state.get("full_track_capture") or {}).get("strategy")
+                    or "rolling_full_track"
+                )
+                baseline_key = "full_track_capture_baseline"
+            else:
+                archives = []
+        if not archives:
+            archives = self._sorted_audio_archives(session)
+            if not archives:
+                raise RuntimeError("No archived audio was available for the final transcription quality pass.")
 
         archives.sort(
             key=lambda item: (
@@ -3016,7 +3531,7 @@ class DelegateService:
             )
         )
         baseline_started_at = str(
-            session.ai_state.get("audio_capture_baseline")
+            session.ai_state.get(baseline_key)
             or archives[0].get("created_at")
             or utcnow_iso()
         )
@@ -3056,6 +3571,7 @@ class DelegateService:
             "conversation_path": None if conversation_track is None else conversation_track.get("path"),
             "archive_gap_count": int(microphone_track.get("gap_count") or 0) + int(system_track.get("gap_count") or 0),
             "archives": archives,
+            "archive_strategy": archive_strategy,
         }
 
     def _transcribe_archived_audio_segments_for_final_pass(
@@ -3643,6 +4159,64 @@ class DelegateService:
         safe_title = self._sanitize_export_component(title) or "회의 요약"
         timestamp = self._export_timestamp_label(session)
         return f"{timestamp}-{safe_title}"[:140].rstrip(" .-_")
+
+    def _ensure_completion_timing_bucket(self, session: DelegateSession) -> dict[str, Any]:
+        timing_root = dict(session.ai_state.get("performance_timing") or {})
+        completion = dict(timing_root.get("completion_pipeline") or {})
+        timing_root["completion_pipeline"] = completion
+        session.ai_state["performance_timing"] = timing_root
+        return completion
+
+    def _begin_completion_timing(self, session: DelegateSession, *, started_at: str) -> None:
+        completion = self._ensure_completion_timing_bucket(session)
+        completion.clear()
+        completion.update(
+            {
+                "started_at": started_at,
+                "status": "running",
+                "session_id": session.session_id,
+            }
+        )
+
+    def _record_completion_timing(
+        self,
+        session: DelegateSession,
+        stage: str,
+        *,
+        elapsed_seconds: float,
+        started_at: str,
+        finished_at: str,
+        status: str,
+        **extra: Any,
+    ) -> None:
+        completion = self._ensure_completion_timing_bucket(session)
+        payload: dict[str, Any] = {
+            "elapsed_seconds": round(max(float(elapsed_seconds), 0.0), 3),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": status,
+        }
+        for key, value in extra.items():
+            if value is None:
+                continue
+            payload[key] = value
+        completion[stage] = payload
+        completion["updated_at"] = finished_at
+
+    def _finalize_completion_timing(
+        self,
+        session: DelegateSession,
+        *,
+        started_at: str,
+        pipeline_started_perf: float,
+        status: str,
+    ) -> None:
+        completion = self._ensure_completion_timing_bucket(session)
+        completion["status"] = status
+        completion["finished_at"] = utcnow_iso()
+        completion["elapsed_seconds"] = round(max(time.perf_counter() - pipeline_started_perf, 0.0), 3)
+        completion["started_at"] = started_at
+        completion["updated_at"] = completion["finished_at"]
 
     def _export_timestamp_label(self, session: DelegateSession) -> str:
         raw = str(session.created_at or session.updated_at or "").strip()
