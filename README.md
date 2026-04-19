@@ -1,6 +1,6 @@
 # ZOOM_MEETING_BOT
 
-`zoom-meeting-bot`은 자신의 PC에서 Zoom 회의를 수집하고, 로컬 AI 흐름으로 정리한 뒤, 최종 결과물을 PDF로 만들어주는 메뉴형 CLI 킷입니다.
+`gesia-meeting-bot`은 자신의 PC에서 Zoom 회의를 수집하고, 로컬 AI 흐름으로 정리한 뒤, 최종 결과물을 PDF로 만들어주는 메뉴형 CLI 킷입니다.
 
 이 패키지는 GitHub 저장소를 직접 받아서 다루는 개발자용 문서보다, **npm으로 설치해서 바로 쓰는 실제 사용자**를 기준으로 안내합니다.
 
@@ -32,7 +32,7 @@
 ## 설치 방법
 
 ```bash
-npm install -g zoom-meeting-bot
+npm install -g gesia-meeting-bot
 ```
 
 ## 실행 방법
@@ -46,7 +46,7 @@ zoom-meeting-bot
 즉, 일반 사용자는 아래 두 줄만 알면 됩니다.
 
 ```bash
-npm install -g zoom-meeting-bot
+npm install -g gesia-meeting-bot
 zoom-meeting-bot
 ```
 
@@ -190,7 +190,7 @@ zoom-meeting-bot
 
 처음에는 복잡한 명령어를 직접 외우기보다, 아래 흐름만 따라가는 것을 권장합니다.
 
-1. `npm install -g zoom-meeting-bot`
+1. `npm install -g gesia-meeting-bot`
 2. `zoom-meeting-bot`
 3. `[1] 처음 설정하기`
 4. `[2] 런처 시작`
@@ -216,7 +216,7 @@ zoom-meeting-bot
 이제 일반 사용자는 GitHub 저장소를 직접 받을 필요 없이 아래 두 줄만으로 설치와 실행이 가능합니다.
 
 ```bash
-npm install -g zoom-meeting-bot
+npm install -g gesia-meeting-bot
 zoom-meeting-bot
 ```
 

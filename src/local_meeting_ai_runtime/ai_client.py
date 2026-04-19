@@ -212,6 +212,17 @@ class AiDelegateClient:
             1,
             min(self._env_int("DELEGATE_RESULT_IMAGE_MAX_COUNT", 8), 20),
         )
+        self._result_image_max_concurrency = max(
+            1,
+            min(self._env_int("DELEGATE_RESULT_IMAGE_MAX_CONCURRENCY", 2), 4),
+        )
+        self._result_image_mcp_max_concurrency = max(
+            1,
+            min(
+                self._env_int("DELEGATE_RESULT_IMAGE_MCP_MAX_CONCURRENCY", 1),
+                self._result_image_max_concurrency,
+            ),
+        )
         self._result_image_timeout = float(os.getenv("DELEGATE_RESULT_IMAGE_TIMEOUT_SECONDS", "180"))
         self._result_image_review_attempts = max(
             1,
@@ -221,6 +232,8 @@ class AiDelegateClient:
             os.getenv("DELEGATE_RESULT_IMAGE_REVIEW_TIMEOUT_SECONDS", "180")
         )
         self._result_image_mcp_server_config = self._resolve_result_image_mcp_server_config()
+        self._result_image_mcp_concurrency_loop: asyncio.AbstractEventLoop | None = None
+        self._result_image_mcp_concurrency_semaphore: asyncio.Semaphore | None = None
         self._generated_meeting_output_skill: dict[str, object] | None = None
         self._configured_meeting_output_override = False
         if override_skill_path:
@@ -1533,8 +1546,8 @@ class AiDelegateClient:
         policy = dict(
             dict(session.ai_state.get("meeting_output_skill") or {}).get("result_generation_policy") or {}
         )
-        materialized: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
+        materialized_slots: list[list[dict[str, Any]] | None] = [None] * len(requests)
         image_request_total = len(
             [
                 item
@@ -1544,7 +1557,8 @@ class AiDelegateClient:
             ]
         )
         image_request_index = 0
-        for item in requests:
+        image_jobs: list[dict[str, Any]] = []
+        for request_index, item in enumerate(requests):
             image_path = str(item.get("image_path") or "").strip()
             count = self._coerce_positive_count(item.get("count"), default=1)
             should_generate_image = (
@@ -1552,142 +1566,205 @@ class AiDelegateClient:
                 and not image_path
             )
             if not should_generate_image:
-                materialized.append(dict(item))
+                materialized_slots[request_index] = [dict(item)]
                 continue
-            request_started_at = self._now_iso()
-            request_perf = time.perf_counter()
-            request_timing: dict[str, Any] = {
-                "title": str(item.get("title") or "").strip(),
-                "target_heading": str(item.get("target_heading") or "").strip(),
-                "requested_count": count,
-                "started_at": request_started_at,
-                "attempts": [],
-            }
             image_request_index += 1
-            if progress_callback is not None:
-                title_text = str(item.get("title") or "").strip()
-                detail = f"{image_request_index}/{image_request_total}번째 이미지를 준비하고 있습니다."
-                if title_text:
-                    detail = f"{detail} ({title_text})"
-                progress_callback(
-                    "generating_images",
-                    "이미지를 만드는 중입니다.",
-                    detail,
-                )
-            preparation_perf = time.perf_counter()
-            prepared_request = self._enrich_result_image_request(
-                session,
-                title=title,
-                request=dict(item),
-                context_result=context_result,
-            )
-            request_timing["preparation_seconds"] = round(max(time.perf_counter() - preparation_perf, 0.0), 3)
-            approved_paths: list[Path] = []
-            review_failures: list[dict[str, str]] = []
-            review_feedback = str(prepared_request.get("review_feedback") or "").strip()
-            last_generation_error = ""
-            for attempt_index in range(self._result_image_review_attempts):
-                attempt_started_at = self._now_iso()
-                attempt_timing: dict[str, Any] = {
-                    "attempt_index": attempt_index + 1,
-                    "started_at": attempt_started_at,
+            image_jobs.append(
+                {
+                    "request_index": request_index,
+                    "image_request_index": image_request_index,
+                    "item": dict(item),
+                    "count": count,
                 }
-                attempt_request = dict(prepared_request)
-                if review_feedback:
-                    attempt_request["review_feedback"] = review_feedback
-                else:
-                    attempt_request["review_feedback"] = ""
-                generate_perf = time.perf_counter()
-                try:
-                    generated_paths = await self._generate_result_images(
+            )
+        if image_jobs:
+            semaphore = asyncio.Semaphore(self._result_image_max_concurrency)
+
+            async def run_image_job(job: dict[str, Any]) -> dict[str, Any]:
+                async with semaphore:
+                    return await self._materialize_result_generation_image_request(
                         session,
+                        request=job["item"],
+                        request_index=int(job["request_index"]),
+                        image_request_index=int(job["image_request_index"]),
+                        image_request_total=image_request_total,
+                        count=int(job["count"]),
+                        output_dir=output_dir,
+                        visuals_dir=visuals_dir,
                         title=title,
-                        request=attempt_request,
-                        count=count,
-                        output_dir=visuals_dir,
+                        context_result=context_result,
                         rendering_policy=policy,
+                        progress_callback=progress_callback,
                     )
-                    attempt_timing["generate_seconds"] = round(max(time.perf_counter() - generate_perf, 0.0), 3)
-                    attempt_timing["generated_candidate_count"] = len(generated_paths)
-                except Exception as exc:
-                    attempt_timing["generate_seconds"] = round(max(time.perf_counter() - generate_perf, 0.0), 3)
-                    attempt_timing["generation_error"] = str(exc).strip() or exc.__class__.__name__
-                    attempt_timing["finished_at"] = self._now_iso()
-                    request_timing["attempts"].append(attempt_timing)
-                    last_generation_error = str(exc).strip() or exc.__class__.__name__
-                    review_failures = []
-                    break
-                if not generated_paths:
-                    attempt_timing["review_seconds"] = 0.0
-                    attempt_timing["approved_count"] = 0
-                    attempt_timing["review_failure_count"] = 0
-                    attempt_timing["finished_at"] = self._now_iso()
-                    request_timing["attempts"].append(attempt_timing)
-                    review_failures = []
-                    break
-                review_perf = time.perf_counter()
-                approved_paths, review_failures = await self._review_result_image_candidates(
+
+            task_results = await asyncio.gather(
+                *(asyncio.create_task(run_image_job(job)) for job in image_jobs)
+            )
+            for task_result in sorted(task_results, key=lambda item: int(item["request_index"])):
+                materialized_slots[int(task_result["request_index"])] = list(task_result["materialized"])
+                errors.extend(list(task_result["errors"]))
+                if timing_entries is not None:
+                    timing_entries.append(dict(task_result["timing"]))
+        if errors:
+            session.ai_state["result_generation_errors"] = errors
+        materialized: list[dict[str, Any]] = []
+        for slot in materialized_slots:
+            if slot:
+                materialized.extend(slot)
+        return materialized
+
+    async def _materialize_result_generation_image_request(
+        self,
+        session: DelegateSession,
+        *,
+        request: dict[str, Any],
+        request_index: int,
+        image_request_index: int,
+        image_request_total: int,
+        count: int,
+        output_dir: Path,
+        visuals_dir: Path,
+        title: str,
+        context_result: dict[str, Any],
+        rendering_policy: dict[str, Any],
+        progress_callback: Callable[[str, str, str | None], None] | None = None,
+    ) -> dict[str, Any]:
+        request_started_at = self._now_iso()
+        request_perf = time.perf_counter()
+        request_timing: dict[str, Any] = {
+            "title": str(request.get("title") or "").strip(),
+            "target_heading": str(request.get("target_heading") or "").strip(),
+            "requested_count": count,
+            "started_at": request_started_at,
+            "attempts": [],
+        }
+        if progress_callback is not None:
+            title_text = str(request.get("title") or "").strip()
+            detail = f"{image_request_index}/{image_request_total}번째 이미지를 준비하고 있습니다."
+            if title_text:
+                detail = f"{detail} ({title_text})"
+            progress_callback(
+                "generating_images",
+                "이미지를 만드는 중입니다.",
+                detail,
+            )
+        preparation_perf = time.perf_counter()
+        prepared_request = self._enrich_result_image_request(
+            session,
+            title=title,
+            request=dict(request),
+            context_result=context_result,
+        )
+        request_timing["preparation_seconds"] = round(max(time.perf_counter() - preparation_perf, 0.0), 3)
+        approved_paths: list[Path] = []
+        review_failures: list[dict[str, str]] = []
+        review_feedback = str(prepared_request.get("review_feedback") or "").strip()
+        last_generation_error = ""
+        for attempt_index in range(self._result_image_review_attempts):
+            attempt_started_at = self._now_iso()
+            attempt_timing: dict[str, Any] = {
+                "attempt_index": attempt_index + 1,
+                "started_at": attempt_started_at,
+            }
+            attempt_request = dict(prepared_request)
+            if review_feedback:
+                attempt_request["review_feedback"] = review_feedback
+            else:
+                attempt_request["review_feedback"] = ""
+            generate_perf = time.perf_counter()
+            try:
+                generated_paths = await self._generate_result_images(
                     session,
                     title=title,
                     request=attempt_request,
-                    context_result=context_result,
-                    candidate_paths=generated_paths,
+                    count=count,
+                    output_dir=visuals_dir,
+                    rendering_policy=rendering_policy,
                 )
-                attempt_timing["review_seconds"] = round(max(time.perf_counter() - review_perf, 0.0), 3)
-                attempt_timing["approved_count"] = len(approved_paths)
-                attempt_timing["review_failure_count"] = len(review_failures)
+                attempt_timing["generate_seconds"] = round(max(time.perf_counter() - generate_perf, 0.0), 3)
+                attempt_timing["generated_candidate_count"] = len(generated_paths)
+            except Exception as exc:
+                attempt_timing["generate_seconds"] = round(max(time.perf_counter() - generate_perf, 0.0), 3)
+                attempt_timing["generation_error"] = str(exc).strip() or exc.__class__.__name__
                 attempt_timing["finished_at"] = self._now_iso()
                 request_timing["attempts"].append(attempt_timing)
-                if approved_paths:
-                    prepared_request = dict(attempt_request)
-                    prepared_request["review_status"] = "approved"
-                    prepared_request["review_note"] = self._summarize_result_image_review_issues(review_failures)
-                    break
-                review_feedback = self._summarize_result_image_review_issues(review_failures)
-            final_paths = approved_paths
-            if not final_paths:
-                note = review_feedback or last_generation_error or "The generated image did not pass review."
-                prepared_request["review_status"] = "rejected"
-                prepared_request["review_note"] = note
-                request_timing["status"] = "rejected"
-                request_timing["approved_count"] = 0
-                request_timing["review_note"] = note
-                request_timing["finished_at"] = self._now_iso()
-                request_timing["elapsed_seconds"] = round(max(time.perf_counter() - request_perf, 0.0), 3)
-                if timing_entries is not None:
-                    timing_entries.append(request_timing)
-                errors.append(
-                    {
-                        "title": str(item.get("title") or "").strip(),
-                        "error": note,
-                    }
-                )
-                materialized.append(prepared_request)
-                continue
-            final_count = len(final_paths)
-            request_timing["status"] = "approved"
-            request_timing["approved_count"] = final_count
+                last_generation_error = str(exc).strip() or exc.__class__.__name__
+                review_failures = []
+                break
+            if not generated_paths:
+                attempt_timing["review_seconds"] = 0.0
+                attempt_timing["approved_count"] = 0
+                attempt_timing["review_failure_count"] = 0
+                attempt_timing["finished_at"] = self._now_iso()
+                request_timing["attempts"].append(attempt_timing)
+                review_failures = []
+                break
+            review_perf = time.perf_counter()
+            approved_paths, review_failures = await self._review_result_image_candidates(
+                session,
+                title=title,
+                request=attempt_request,
+                context_result=context_result,
+                candidate_paths=generated_paths,
+            )
+            attempt_timing["review_seconds"] = round(max(time.perf_counter() - review_perf, 0.0), 3)
+            attempt_timing["approved_count"] = len(approved_paths)
+            attempt_timing["review_failure_count"] = len(review_failures)
+            attempt_timing["finished_at"] = self._now_iso()
+            request_timing["attempts"].append(attempt_timing)
+            if approved_paths:
+                prepared_request = dict(attempt_request)
+                prepared_request["review_status"] = "approved"
+                prepared_request["review_note"] = self._summarize_result_image_review_issues(review_failures)
+                break
+            review_feedback = self._summarize_result_image_review_issues(review_failures)
+        final_paths = approved_paths
+        if not final_paths:
+            note = review_feedback or last_generation_error or "The generated image did not pass review."
+            prepared_request["review_status"] = "rejected"
+            prepared_request["review_note"] = note
+            request_timing["status"] = "rejected"
+            request_timing["approved_count"] = 0
+            request_timing["review_note"] = note
             request_timing["finished_at"] = self._now_iso()
             request_timing["elapsed_seconds"] = round(max(time.perf_counter() - request_perf, 0.0), 3)
-            if timing_entries is not None:
-                timing_entries.append(request_timing)
-            for index, path in enumerate(final_paths, start=1):
-                cloned = dict(prepared_request)
-                # Generated visuals are treated as complete artifacts now.
-                # Do not rebuild them into a local table/card PNG shell.
-                cloned["image_path"] = self._display_result_path(path, base_dir=output_dir)
-                if final_count > 1:
-                    title_text = str(cloned.get("title") or "").strip()
-                    caption_text = (
-                        str(cloned.get("caption") or "").strip()
-                        or str(cloned.get("title") or "").strip()
-                    )
-                    cloned["title"] = f"{title_text} {index}/{final_count}".strip()
-                    cloned["caption"] = f"{caption_text} ({index}/{final_count})".strip()
-                materialized.append(cloned)
-        if errors:
-            session.ai_state["result_generation_errors"] = errors
-        return materialized
+            return {
+                "request_index": request_index,
+                "materialized": [prepared_request],
+                "errors": [
+                    {
+                        "title": str(request.get("title") or "").strip(),
+                        "error": note,
+                    }
+                ],
+                "timing": request_timing,
+            }
+        final_count = len(final_paths)
+        request_timing["status"] = "approved"
+        request_timing["approved_count"] = final_count
+        request_timing["finished_at"] = self._now_iso()
+        request_timing["elapsed_seconds"] = round(max(time.perf_counter() - request_perf, 0.0), 3)
+        materialized: list[dict[str, Any]] = []
+        for index, path in enumerate(final_paths, start=1):
+            cloned = dict(prepared_request)
+            # Generated visuals are treated as complete artifacts now.
+            # Do not rebuild them into a local table/card PNG shell.
+            cloned["image_path"] = self._display_result_path(path, base_dir=output_dir)
+            if final_count > 1:
+                title_text = str(cloned.get("title") or "").strip()
+                caption_text = (
+                    str(cloned.get("caption") or "").strip()
+                    or str(cloned.get("title") or "").strip()
+                )
+                cloned["title"] = f"{title_text} {index}/{final_count}".strip()
+                cloned["caption"] = f"{caption_text} ({index}/{final_count})".strip()
+            materialized.append(cloned)
+        return {
+            "request_index": request_index,
+            "materialized": materialized,
+            "errors": [],
+            "timing": request_timing,
+        }
 
     def _enrich_result_image_request(
         self,
@@ -1849,14 +1926,17 @@ class AiDelegateClient:
                     "Image generation is unavailable until the local MCP server is configured."
                 )
             try:
-                return await self._generate_result_images_with_nanobanana_mcp(
-                    session,
-                    title=title,
-                    request=request,
-                    count=count,
-                    output_dir=output_dir,
-                    rendering_policy=rendering_policy,
-                )
+                # Keep the request pipeline concurrent, but avoid overlapping direct MCP
+                # launches beyond the configured backend capacity.
+                async with self._get_result_image_mcp_concurrency_semaphore():
+                    return await self._generate_result_images_with_nanobanana_mcp(
+                        session,
+                        title=title,
+                        request=request,
+                        count=count,
+                        output_dir=output_dir,
+                        rendering_policy=rendering_policy,
+                    )
             except Exception as exc:
                 raise RuntimeError(f"Local nanobanana MCP image generation failed: {exc}") from exc
         if self._codex_ready:
@@ -1876,6 +1956,18 @@ class AiDelegateClient:
             "The local nanobanana MCP route is not configured on this PC. "
             "Image generation is unavailable until the local MCP server is configured."
         )
+
+    def _get_result_image_mcp_concurrency_semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if (
+            self._result_image_mcp_concurrency_loop is not loop
+            or self._result_image_mcp_concurrency_semaphore is None
+        ):
+            self._result_image_mcp_concurrency_loop = loop
+            self._result_image_mcp_concurrency_semaphore = asyncio.Semaphore(
+                self._result_image_mcp_max_concurrency
+            )
+        return self._result_image_mcp_concurrency_semaphore
 
     def _build_result_image_prompt(
         self,

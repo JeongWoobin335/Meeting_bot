@@ -1,8 +1,8 @@
 {
-  "name": "zoom-meeting-bot",
-  "version": "0.1.2",
+  "name": "gesia-meeting-bot",
+  "version": "0.1.3",
   "description": "Global npm launcher for the Zoom Meeting Bot CLI kit.",
-  "author": "Jeong Woobin",
+  "author": "GESIA Platform",
   "license": "UNLICENSED",
   "homepage": "https://github.com/JeongWoobin335/Meeting_bot#readme",
   "bugs": {

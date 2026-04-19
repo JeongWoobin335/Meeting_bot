@@ -243,6 +243,126 @@ class AiClientImagePipelineTest(unittest.TestCase):
         self.assertEqual(request_timing.get("approved_count"), 0)
         self.assertIn("책임 관계 구조", str(request_timing.get("review_note") or ""))
 
+    def test_materialize_result_generation_runs_two_image_requests_concurrently_and_keeps_result_order(self) -> None:
+        client = AiDelegateClient()
+        client._result_image_review_attempts = 1
+        session = self._session()
+
+        client._build_result_image_structure_plan = lambda *_args, **_kwargs: {
+            "agenda_context": "회의 전체는 책임 구조와 승인 흐름을 정리한다.",
+            "block_focus": "이 블록은 운영 게이트와 책임 주체를 묶는다.",
+            "core_message": "승인 없는 생성물은 운영 단계로 넘어가면 안 된다.",
+            "visual_archetype": "responsibility_map",
+            "visual_center": "책임 주체와 승인 게이트가 연결된 구조",
+            "key_entities": ["책임 주체", "검토", "승인"],
+            "key_relationships": ["생성 후 검토", "검토 후 승인"],
+            "must_include_labels": ["책임", "검토", "승인"],
+            "avoid_elements": ["generic 장면"],
+            "composition_notes": "중앙 구조를 먼저 보여준다.",
+            "style_notes": "업무 문서형 도식으로 정리한다.",
+        }
+
+        active_generations = 0
+        max_active_generations = 0
+        both_started = asyncio.Event()
+        release_first_batch = asyncio.Event()
+
+        async def fake_generate(_session, *, request, output_dir, **_kwargs):
+            nonlocal active_generations, max_active_generations
+            title = str(request.get("title") or "").strip()
+            active_generations += 1
+            max_active_generations = max(max_active_generations, active_generations)
+            if active_generations == 2:
+                both_started.set()
+            if title in {"Visual 1", "Visual 2"}:
+                await both_started.wait()
+                await release_first_batch.wait()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            path = output_dir / f"{title.replace(' ', '-').lower()}.png"
+            path.write_bytes(_PNG_1X1)
+            if title == "Visual 1":
+                await asyncio.sleep(0.05)
+            active_generations -= 1
+            return [path]
+
+        async def fake_review(_session, *, candidate_paths, **_kwargs):
+            return (list(candidate_paths), [])
+
+        client._generate_result_images = fake_generate
+        client._review_result_image_candidates = fake_review
+
+        async def run_pipeline() -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                task = asyncio.create_task(
+                    client.materialize_result_generation(
+                        session,
+                        {
+                            "title": "AI governance framework",
+                            "executive_summary": "The meeting defined responsibility owners and approval gates.",
+                            "sections": [
+                                {"heading": "Section 1", "summary": "Summary 1"},
+                                {"heading": "Section 2", "summary": "Summary 2"},
+                                {"heading": "Section 3", "summary": "Summary 3"},
+                            ],
+                            "postprocess_requests": [
+                                {
+                                    "kind": "image_brief",
+                                    "title": "Visual 1",
+                                    "instruction": "Show the first governance structure.",
+                                    "prompt": "Create the first diagram.",
+                                    "tool_hint": "nano-banana-2",
+                                    "caption": "Visual 1",
+                                    "count": "1",
+                                    "placement_notes": "Place after section 1",
+                                    "target_heading": "Section 1",
+                                },
+                                {
+                                    "kind": "image_brief",
+                                    "title": "Visual 2",
+                                    "instruction": "Show the second governance structure.",
+                                    "prompt": "Create the second diagram.",
+                                    "tool_hint": "nano-banana-2",
+                                    "caption": "Visual 2",
+                                    "count": "1",
+                                    "placement_notes": "Place after section 2",
+                                    "target_heading": "Section 2",
+                                },
+                                {
+                                    "kind": "image_brief",
+                                    "title": "Visual 3",
+                                    "instruction": "Show the third governance structure.",
+                                    "prompt": "Create the third diagram.",
+                                    "tool_hint": "nano-banana-2",
+                                    "caption": "Visual 3",
+                                    "count": "1",
+                                    "placement_notes": "Place after section 3",
+                                    "target_heading": "Section 3",
+                                },
+                            ],
+                        },
+                        output_dir=Path(temp_dir),
+                    )
+                )
+                await asyncio.wait_for(both_started.wait(), timeout=1.0)
+                release_first_batch.set()
+                return await task
+
+        result = asyncio.run(run_pipeline())
+
+        self.assertEqual(max_active_generations, 2)
+        self.assertEqual(
+            [str(item.get("title") or "") for item in result["postprocess_requests"]],
+            ["Visual 1", "Visual 2", "Visual 3"],
+        )
+        timing = dict(session.ai_state.get("performance_timing") or {}).get("result_generation")
+        self.assertIsInstance(timing, dict)
+        assert isinstance(timing, dict)
+        self.assertEqual(len(list(timing.get("requests") or [])), 3)
+        self.assertEqual(
+            [str(item.get("title") or "") for item in list(timing.get("requests") or [])],
+            ["Visual 1", "Visual 2", "Visual 3"],
+        )
+
     def test_build_codex_command_keeps_schema_on_resume(self) -> None:
         client = AiDelegateClient()
         client._codex_path = "codex"
@@ -295,6 +415,59 @@ class AiClientImagePipelineTest(unittest.TestCase):
         self.assertEqual(called["count"], 1)
         self.assertEqual(len(result), 1)
         self.assertTrue(str(result[0]).endswith(".png"))
+
+    def test_generate_result_images_serializes_direct_mcp_calls_by_default(self) -> None:
+        client = AiDelegateClient()
+        client._result_image_direct_mcp = True
+        client._result_image_mcp_server_config = {
+            "command": "uvx",
+            "args": ["nanobanana-mcp-server@latest"],
+            "env": {},
+            "cwd": str(Path.cwd()),
+            "source": "test",
+        }
+        client._result_image_mcp_max_concurrency = 1
+        client._result_image_mcp_concurrency_loop = None
+        client._result_image_mcp_concurrency_semaphore = None
+
+        active_direct_calls = 0
+        max_active_direct_calls = 0
+
+        async def fake_direct(_session, *, request, output_dir, **_kwargs):
+            nonlocal active_direct_calls, max_active_direct_calls
+            active_direct_calls += 1
+            max_active_direct_calls = max(max_active_direct_calls, active_direct_calls)
+            await asyncio.sleep(0.05)
+            active_direct_calls -= 1
+            return [output_dir / f"{str(request.get('title') or 'visual').strip()}.png"]
+
+        client._generate_result_images_with_nanobanana_mcp = fake_direct
+
+        async def run_pair() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_dir = Path(temp_dir)
+                await asyncio.gather(
+                    client._generate_result_images(
+                        self._session(),
+                        title="AI governance framework",
+                        request={"title": "Visual 1", "tool_hint": "nano-banana-2"},
+                        count=1,
+                        output_dir=output_dir,
+                        rendering_policy={},
+                    ),
+                    client._generate_result_images(
+                        self._session(),
+                        title="AI governance framework",
+                        request={"title": "Visual 2", "tool_hint": "nano-banana-2"},
+                        count=1,
+                        output_dir=output_dir,
+                        rendering_policy={},
+                    ),
+                )
+
+        asyncio.run(run_pair())
+
+        self.assertEqual(max_active_direct_calls, 1)
 
     def test_generate_result_images_requires_nanobanana_mcp_when_direct_enabled(self) -> None:
         client = AiDelegateClient()
