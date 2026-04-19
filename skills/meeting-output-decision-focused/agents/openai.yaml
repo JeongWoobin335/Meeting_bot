@@ -1,4 +1,0 @@
-interface:
-  display_name: "Decision Focused Output"
-  short_description: "Decision-first meeting output style example."
-  default_prompt: "Use the decision-focused meeting output skill for meetings that should emphasize decisions, follow-ups, and unresolved questions."
