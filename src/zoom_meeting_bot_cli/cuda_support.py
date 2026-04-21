@@ -176,6 +176,7 @@ def build_torch_cuda_install_commands() -> list[list[str]]:
         "-m",
         "pip",
         "install",
+        "--no-cache-dir",
         "--upgrade",
         "--force-reinstall",
         "--index-url",

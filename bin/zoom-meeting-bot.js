@@ -82,12 +82,12 @@ function ensureBootstrap(workspaceRoot) {
   if (needsInstall) {
     fs.mkdirSync(path.dirname(markerPath), { recursive: true });
     printInfo("Python 의존성과 CLI 진입점을 연결합니다.");
-    runChecked(venvPython, ["-m", "pip", "install", "--upgrade", "pip", "setuptools<82", "wheel"], {
+    runChecked(venvPython, ["-m", "pip", "install", "--no-cache-dir", "--upgrade", "pip", "setuptools<82", "wheel"], {
       cwd: PACKAGE_ROOT,
       env: buildRuntimeEnv(workspaceRoot),
       stdio: "inherit",
     });
-    runChecked(venvPython, ["-m", "pip", "install", "-e", PACKAGE_ROOT], {
+    runChecked(venvPython, ["-m", "pip", "install", "--no-cache-dir", "-e", PACKAGE_ROOT], {
       cwd: PACKAGE_ROOT,
       env: buildRuntimeEnv(workspaceRoot),
       stdio: "inherit",
