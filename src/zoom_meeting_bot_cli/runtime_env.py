@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from local_meeting_ai_runtime.assets import find_whisper_cpp_model
+from meeting_bot_temp import apply_temp_env
 
 from .config import DEFAULT_WHISPER_CPP_MODEL_NAME
 from .paths import WORKSPACE_ROOT_ENV, package_root, resolve_package_path, resolve_relative_path, resolve_workspace_path, workspace_root
@@ -34,6 +35,7 @@ def build_runtime_env(config: dict[str, Any]) -> dict[str, str]:
     src_root = package_root() / "src"
     _augment_macos_homebrew_path(env)
     env[WORKSPACE_ROOT_ENV] = str(workspace_root())
+    apply_temp_env(env, workspace_dir=workspace_root())
     current_pythonpath = env.get("PYTHONPATH", "").strip()
     pythonpath_parts = [str(src_root)]
     if current_pythonpath:

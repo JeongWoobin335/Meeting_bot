@@ -10,6 +10,7 @@ const PACKAGE_JSON_PATH = path.join(PACKAGE_ROOT, "package.json");
 const PACKAGE_MANIFEST = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, "utf8"));
 const WORKSPACE_ENV = "ZOOM_MEETING_BOT_HOME";
 const BOOTSTRAP_PYTHON_ENV = "ZOOM_MEETING_BOT_BOOTSTRAP_PYTHON";
+const TEMP_ROOT_ENV = "ZOOM_MEETING_BOT_TEMP_HOME";
 
 function main() {
   const workspaceRoot = resolveWorkspaceRoot();
@@ -146,12 +147,22 @@ function resolveVenvPython(workspaceRoot) {
 
 function buildRuntimeEnv(workspaceRoot) {
   const env = { ...process.env };
+  const tempRoot = resolveAppTempRoot(workspaceRoot);
+  fs.mkdirSync(tempRoot, { recursive: true });
   env[WORKSPACE_ENV] = workspaceRoot;
+  env[TEMP_ROOT_ENV] = tempRoot;
+  env.TEMP = tempRoot;
+  env.TMP = tempRoot;
+  env.TMPDIR = tempRoot;
   env.PYTHONUTF8 = "1";
   env.PYTHONIOENCODING = "utf-8";
   env.PIP_DISABLE_PIP_VERSION_CHECK = "1";
   env.PYTHONPATH = appendPath(path.join(PACKAGE_ROOT, "src"), env.PYTHONPATH || "");
   return env;
+}
+
+function resolveAppTempRoot(workspaceRoot) {
+  return path.join(workspaceRoot, ".tmp", "zoom-meeting-bot", "system-temp");
 }
 
 function appendPath(prefix, currentValue) {

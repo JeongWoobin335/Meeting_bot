@@ -10,6 +10,11 @@ from typing import Any
 
 import uvicorn
 
+from meeting_bot_temp import apply_temp_env, cleanup_stale_app_temp
+
+apply_temp_env()
+cleanup_stale_app_temp()
+
 from .assets import prepare_whisper_cpp_assets, whisper_cpp_asset_status
 from .app import create_service
 
