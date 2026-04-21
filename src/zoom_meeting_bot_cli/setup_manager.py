@@ -18,7 +18,13 @@ from local_meeting_ai_runtime.assets import (
 )
 
 from .config import DEFAULT_WHISPER_CPP_MODEL_NAME
-from .cuda_support import build_torch_cuda_install_commands, detect_cuda_gpu, inspect_torch_runtime, torch_cuda_index_url
+from .cuda_support import (
+    build_torch_cuda_install_commands,
+    detect_cuda_gpu,
+    inspect_torch_runtime,
+    inspect_torch_runtime_fresh_process,
+    torch_cuda_index_url,
+)
 from .model_manager import prepare_models
 from .paths import package_root, resolve_relative_path, workspace_root
 from .platform_support import (
@@ -273,7 +279,9 @@ def _ensure_cuda_torch_runtime(*, yes: bool, steps: list[dict[str, Any]]) -> Non
             f"Last error: {install_error or 'unknown error'} | index URL: {torch_cuda_index_url()}"
         )
 
-    runtime_after = inspect_torch_runtime()
+    # Re-check in a fresh interpreter so force-reinstalled torch wheels are not
+    # masked by a previously imported in-process module.
+    runtime_after = inspect_torch_runtime_fresh_process()
     if not bool(runtime_after.get("cuda_enabled")):
         raise RuntimeError(
             "CUDA-capable GPU was detected, but torch still cannot use CUDA after installation. "

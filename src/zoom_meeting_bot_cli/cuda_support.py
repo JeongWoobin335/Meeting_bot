@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -89,6 +90,75 @@ def inspect_torch_runtime() -> dict[str, Any]:
     except Exception as exc:
         payload["detail"] = f"torch is installed, but inspection failed: {exc}"
     return payload
+
+
+def inspect_torch_runtime_fresh_process(*, python_executable: str | None = None) -> dict[str, Any]:
+    executable = str(python_executable or sys.executable).strip() or sys.executable
+    script = """
+import importlib.metadata
+import importlib.util
+import json
+
+payload = {
+    "installed": False,
+    "distribution_version": "",
+    "module_version": "",
+    "cuda_enabled": False,
+    "cuda_version": "",
+    "device_count": 0,
+    "detail": "torch is not installed.",
+}
+if importlib.util.find_spec("torch") is not None:
+    payload["installed"] = True
+    try:
+        payload["distribution_version"] = importlib.metadata.version("torch")
+    except Exception:
+        payload["distribution_version"] = ""
+    try:
+        import torch
+        module_version = str(getattr(torch, "__version__", "") or "")
+        cuda_enabled = bool(torch.cuda.is_available())
+        cuda_version = str(getattr(getattr(torch, "version", None), "cuda", "") or "")
+        device_count = int(torch.cuda.device_count()) if cuda_enabled else 0
+        payload.update(
+            {
+                "module_version": module_version,
+                "cuda_enabled": cuda_enabled,
+                "cuda_version": cuda_version,
+                "device_count": device_count,
+            }
+        )
+        if cuda_enabled:
+            payload["detail"] = (
+                f"torch {module_version or payload['distribution_version']} can use CUDA"
+                f" ({device_count} visible device(s), CUDA {cuda_version or 'unknown'})."
+            )
+        else:
+            payload["detail"] = (
+                f"torch {module_version or payload['distribution_version']} is installed, "
+                "but CUDA is not available in this Python environment."
+            )
+    except Exception as exc:
+        payload["detail"] = f"torch is installed, but inspection failed: {exc}"
+print(json.dumps(payload))
+""".strip()
+    try:
+        result = subprocess.run(
+            [executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            parsed = json.loads(str(result.stdout or "").strip() or "{}")
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+    except Exception:
+        pass
+    return inspect_torch_runtime()
 
 
 def torch_cuda_index_url() -> str:
