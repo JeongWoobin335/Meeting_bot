@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -86,14 +87,43 @@ static async Task WaitForStopSignalAsync()
     }
 }
 
+static string BuildChunkPath(string baseOutputPath, int sequence, bool chunkingEnabled)
+{
+    if (!chunkingEnabled && sequence == 1)
+    {
+        return baseOutputPath;
+    }
+
+    var directory = Path.GetDirectoryName(baseOutputPath) ?? Directory.GetCurrentDirectory();
+    var stem = Path.GetFileNameWithoutExtension(baseOutputPath);
+    var extension = Path.GetExtension(baseOutputPath);
+    return Path.Combine(directory, $"{stem}-{sequence:0000}{extension}");
+}
+
 static async Task<int> RecordAsync(IReadOnlyDictionary<string, string> options)
 {
     var microphoneOutputPath = RequireOption(options, "microphone-output");
     var systemOutputPath = RequireOption(options, "system-output");
     var manifestPath = RequireOption(options, "manifest-path");
     var logPath = options.TryGetValue("log-path", out var requestedLogPath) ? requestedLogPath : "";
+    var rawChunkSeconds = options.TryGetValue("chunk-seconds", out var requestedChunkSeconds) ? requestedChunkSeconds : "";
     var requestedMicrophoneDevice = options.TryGetValue("microphone-device", out var microphoneDeviceName) ? microphoneDeviceName : "";
     var requestedSpeakerDevice = options.TryGetValue("speaker-device", out var speakerDeviceName) ? speakerDeviceName : "";
+    var chunkSeconds = 0.0;
+    if (!string.IsNullOrWhiteSpace(rawChunkSeconds))
+    {
+        _ = double.TryParse(
+            rawChunkSeconds,
+            NumberStyles.Float | NumberStyles.AllowThousands,
+            CultureInfo.InvariantCulture,
+            out chunkSeconds
+        );
+        if (chunkSeconds < 0.0)
+        {
+            chunkSeconds = 0.0;
+        }
+    }
+    var chunkingEnabled = chunkSeconds > 0.0;
 
     Directory.CreateDirectory(Path.GetDirectoryName(microphoneOutputPath)!);
     Directory.CreateDirectory(Path.GetDirectoryName(systemOutputPath)!);
@@ -127,26 +157,164 @@ static async Task<int> RecordAsync(IReadOnlyDictionary<string, string> options)
 
     using var microphoneCapture = new WasapiCapture(microphoneDevice);
     using var systemCapture = new WasapiLoopbackCapture(speakerDevice);
-    using var microphoneWriter = new WaveFileWriter(microphoneOutputPath, microphoneCapture.WaveFormat);
-    using var systemWriter = new WaveFileWriter(systemOutputPath, systemCapture.WaveFormat);
 
-    var microphoneLock = new object();
-    var systemLock = new object();
+    var captureLock = new object();
     long microphoneBytes = 0;
     long systemBytes = 0;
+    long microphoneChunkBytes = 0;
+    long systemChunkBytes = 0;
+    var currentChunkSequence = 0;
+    DateTimeOffset? currentChunkStartedAt = null;
+    string? currentMicrophoneChunkPath = null;
+    string? currentSystemChunkPath = null;
+    WaveFileWriter? microphoneWriter = null;
+    WaveFileWriter? systemWriter = null;
+    var microphoneSegments = new List<Dictionary<string, object?>>();
+    var systemSegments = new List<Dictionary<string, object?>>();
     Exception? fatalError = null;
     var microphoneStopped = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
     var systemStopped = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    Dictionary<string, object?> BuildSegmentPayload(
+        string path,
+        long bytesWritten,
+        WaveFormat format,
+        string deviceFriendlyName,
+        DateTimeOffset startedAt,
+        DateTimeOffset stoppedAt,
+        int sequence)
+    {
+        var seconds = bytesWritten <= 0
+            ? 0.0
+            : bytesWritten / (double)format.AverageBytesPerSecond;
+        return new Dictionary<string, object?>
+        {
+            ["path"] = Path.GetFullPath(path),
+            ["sample_rate"] = format.SampleRate,
+            ["channels"] = format.Channels,
+            ["seconds"] = Math.Round(seconds, 3),
+            ["device_name"] = deviceFriendlyName,
+            ["started_at"] = startedAt.ToString("O"),
+            ["stopped_at"] = stoppedAt.ToString("O"),
+            ["sequence"] = sequence,
+        };
+    }
+
+    void OpenChunk(DateTimeOffset startedAt)
+    {
+        currentChunkSequence += 1;
+        currentChunkStartedAt = startedAt;
+        currentMicrophoneChunkPath = BuildChunkPath(microphoneOutputPath, currentChunkSequence, chunkingEnabled);
+        currentSystemChunkPath = BuildChunkPath(systemOutputPath, currentChunkSequence, chunkingEnabled);
+        microphoneWriter = new WaveFileWriter(currentMicrophoneChunkPath, microphoneCapture.WaveFormat);
+        systemWriter = new WaveFileWriter(currentSystemChunkPath, systemCapture.WaveFormat);
+        microphoneChunkBytes = 0;
+        systemChunkBytes = 0;
+        Log($"chunk-open sequence={currentChunkSequence} started_at={startedAt:O}");
+    }
+
+    void FinalizeChunk(DateTimeOffset stoppedAt)
+    {
+        if (microphoneWriter is null || systemWriter is null || currentChunkStartedAt is null)
+        {
+            microphoneWriter?.Dispose();
+            systemWriter?.Dispose();
+            microphoneWriter = null;
+            systemWriter = null;
+            currentMicrophoneChunkPath = null;
+            currentSystemChunkPath = null;
+            currentChunkStartedAt = null;
+            microphoneChunkBytes = 0;
+            systemChunkBytes = 0;
+            return;
+        }
+
+        microphoneWriter.Flush();
+        systemWriter.Flush();
+        microphoneWriter.Dispose();
+        systemWriter.Dispose();
+
+        if (microphoneChunkBytes > 0 && !string.IsNullOrWhiteSpace(currentMicrophoneChunkPath))
+        {
+            microphoneSegments.Add(
+                BuildSegmentPayload(
+                    currentMicrophoneChunkPath,
+                    microphoneChunkBytes,
+                    microphoneCapture.WaveFormat,
+                    microphoneDevice.FriendlyName,
+                    currentChunkStartedAt.Value,
+                    stoppedAt,
+                    currentChunkSequence
+                )
+            );
+        }
+        else if (!string.IsNullOrWhiteSpace(currentMicrophoneChunkPath) && File.Exists(currentMicrophoneChunkPath))
+        {
+            File.Delete(currentMicrophoneChunkPath);
+        }
+
+        if (systemChunkBytes > 0 && !string.IsNullOrWhiteSpace(currentSystemChunkPath))
+        {
+            systemSegments.Add(
+                BuildSegmentPayload(
+                    currentSystemChunkPath,
+                    systemChunkBytes,
+                    systemCapture.WaveFormat,
+                    speakerDevice.FriendlyName,
+                    currentChunkStartedAt.Value,
+                    stoppedAt,
+                    currentChunkSequence
+                )
+            );
+        }
+        else if (!string.IsNullOrWhiteSpace(currentSystemChunkPath) && File.Exists(currentSystemChunkPath))
+        {
+            File.Delete(currentSystemChunkPath);
+        }
+
+        Log($"chunk-close sequence={currentChunkSequence} stopped_at={stoppedAt:O}");
+        microphoneWriter = null;
+        systemWriter = null;
+        currentMicrophoneChunkPath = null;
+        currentSystemChunkPath = null;
+        currentChunkStartedAt = null;
+        microphoneChunkBytes = 0;
+        systemChunkBytes = 0;
+    }
+
+    void RotateChunkIfNeeded(DateTimeOffset now)
+    {
+        if (!chunkingEnabled || currentChunkStartedAt is null)
+        {
+            return;
+        }
+
+        if ((now - currentChunkStartedAt.Value).TotalSeconds < chunkSeconds)
+        {
+            return;
+        }
+
+        FinalizeChunk(now);
+        OpenChunk(now);
+    }
 
     microphoneCapture.DataAvailable += (_, eventArgs) =>
     {
         try
         {
-            lock (microphoneLock)
+            lock (captureLock)
             {
-                microphoneWriter.Write(eventArgs.Buffer, 0, eventArgs.BytesRecorded);
+                var now = DateTimeOffset.UtcNow;
+                if (microphoneWriter is null || systemWriter is null || currentChunkStartedAt is null)
+                {
+                    OpenChunk(now);
+                }
+
+                microphoneWriter!.Write(eventArgs.Buffer, 0, eventArgs.BytesRecorded);
                 microphoneWriter.Flush();
                 microphoneBytes += eventArgs.BytesRecorded;
+                microphoneChunkBytes += eventArgs.BytesRecorded;
+                RotateChunkIfNeeded(now);
             }
         }
         catch (Exception exc)
@@ -158,11 +326,19 @@ static async Task<int> RecordAsync(IReadOnlyDictionary<string, string> options)
     {
         try
         {
-            lock (systemLock)
+            lock (captureLock)
             {
-                systemWriter.Write(eventArgs.Buffer, 0, eventArgs.BytesRecorded);
+                var now = DateTimeOffset.UtcNow;
+                if (microphoneWriter is null || systemWriter is null || currentChunkStartedAt is null)
+                {
+                    OpenChunk(now);
+                }
+
+                systemWriter!.Write(eventArgs.Buffer, 0, eventArgs.BytesRecorded);
                 systemWriter.Flush();
                 systemBytes += eventArgs.BytesRecorded;
+                systemChunkBytes += eventArgs.BytesRecorded;
+                RotateChunkIfNeeded(now);
             }
         }
         catch (Exception exc)
@@ -201,18 +377,13 @@ static async Task<int> RecordAsync(IReadOnlyDictionary<string, string> options)
     systemCapture.StopRecording();
 
     await Task.WhenAll(microphoneStopped.Task, systemStopped.Task);
-
-    lock (microphoneLock)
-    {
-        microphoneWriter.Flush();
-    }
-
-    lock (systemLock)
-    {
-        systemWriter.Flush();
-    }
-
     var stoppedAt = DateTimeOffset.UtcNow;
+
+    lock (captureLock)
+    {
+        FinalizeChunk(stoppedAt);
+    }
+
     var microphoneSeconds = microphoneBytes / (double)microphoneCapture.WaveFormat.AverageBytesPerSecond;
     var systemSeconds = systemBytes / (double)systemCapture.WaveFormat.AverageBytesPerSecond;
 
@@ -222,21 +393,24 @@ static async Task<int> RecordAsync(IReadOnlyDictionary<string, string> options)
         ["stopped_at"] = stoppedAt.ToString("O"),
         ["microphone"] = new Dictionary<string, object?>
         {
-            ["path"] = Path.GetFullPath(microphoneOutputPath),
+            ["path"] = microphoneSegments.LastOrDefault()?["path"] ?? Path.GetFullPath(microphoneOutputPath),
             ["sample_rate"] = microphoneCapture.WaveFormat.SampleRate,
             ["channels"] = microphoneCapture.WaveFormat.Channels,
             ["seconds"] = Math.Round(microphoneSeconds, 3),
             ["device_name"] = microphoneDevice.FriendlyName,
+            ["segments"] = microphoneSegments,
         },
         ["system"] = new Dictionary<string, object?>
         {
-            ["path"] = Path.GetFullPath(systemOutputPath),
+            ["path"] = systemSegments.LastOrDefault()?["path"] ?? Path.GetFullPath(systemOutputPath),
             ["sample_rate"] = systemCapture.WaveFormat.SampleRate,
             ["channels"] = systemCapture.WaveFormat.Channels,
             ["seconds"] = Math.Round(systemSeconds, 3),
             ["device_name"] = speakerDevice.FriendlyName,
+            ["segments"] = systemSegments,
         },
         ["fatal_error"] = fatalError?.ToString(),
+        ["chunk_seconds"] = chunkSeconds > 0.0 ? chunkSeconds : null,
     };
 
     await File.WriteAllTextAsync(

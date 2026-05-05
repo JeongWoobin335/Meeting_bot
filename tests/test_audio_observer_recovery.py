@@ -68,8 +68,24 @@ class AudioObserverRecoveryTest(unittest.IsolatedAsyncioTestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         sf.write(str(path), audio, sample_rate, format="WAV")
 
-    def _create_orphan_helper_output(self, service: DelegateService, session_id: str) -> tuple[Path, Path]:
+    def _create_orphan_helper_output(
+        self,
+        service: DelegateService,
+        session_id: str,
+        *,
+        segmented_chunks: int = 0,
+    ) -> tuple[Path, Path]:
         helper_dir = Path(service._observer._artifact_dir) / f"windows-audio-helper-{session_id}"
+        if segmented_chunks > 0:
+            for index in range(1, segmented_chunks + 1):
+                microphone_segment = helper_dir / f"microphone-full-track-{index:04d}.wav"
+                system_segment = helper_dir / f"system-full-track-{index:04d}.wav"
+                self._write_wav(microphone_segment, seconds=1.25)
+                self._write_wav(system_segment, seconds=1.25)
+            return (
+                helper_dir / "microphone-full-track-0001.wav",
+                helper_dir / "system-full-track-0001.wav",
+            )
         microphone_path = helper_dir / "microphone-full-track.wav"
         system_path = helper_dir / "system-full-track.wav"
         self._write_wav(microphone_path, seconds=1.25)
@@ -182,6 +198,43 @@ class AudioObserverRecoveryTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(salvaged_second)
             archives = recovered_again.ai_state.get("full_track_archive_paths") or []
             self.assertEqual(len(archives), 2)
+
+    def test_salvage_orphan_windows_helper_segmented_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_service(temp_dir)
+            session = DelegateSession(
+                session_id="salvage-segmented",
+                delegate_mode="answer_on_ask",
+                bot_display_name="WooBIN_bot",
+                status="active",
+                ai_state={
+                    "audio_observer": {
+                        "running": False,
+                        "continuous_mode": True,
+                        "capture_backend": "windows_native_helper",
+                        "restart_payload": {
+                            "system_device_name": "Test Speaker",
+                            "meeting_output_device_name": "Test Speaker",
+                        },
+                    },
+                    "full_track_capture": {
+                        "running": False,
+                        "strategy": "windows_native_full_track",
+                        "chunks": 0,
+                    },
+                    "full_track_capture_baseline": "2026-04-22T11:10:01+09:00",
+                },
+            )
+            session = service.persist_session(session)
+            self._create_orphan_helper_output(service, session.session_id, segmented_chunks=2)
+
+            recovered, salvaged = service._salvage_orphan_windows_helper_output(session)
+
+            self.assertTrue(salvaged)
+            archives = recovered.ai_state.get("full_track_archive_paths") or []
+            self.assertEqual(len(archives), 4)
+            full_track_state = dict(recovered.ai_state.get("full_track_capture") or {})
+            self.assertEqual(int(full_track_state.get("chunks") or 0), 2)
 
 
 if __name__ == "__main__":

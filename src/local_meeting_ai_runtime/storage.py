@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -21,6 +22,9 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
+
+
+_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS = (0.0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0)
 
 
 class _InterProcessFileLock:
@@ -104,10 +108,33 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
             handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        _replace_path_with_retry(temp_path, path)
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+def _replace_path_with_retry(temp_path: str, path: Path) -> None:
+    last_error: OSError | None = None
+    for attempt, delay in enumerate(_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS):
+        try:
+            os.replace(temp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            if not _is_retryable_windows_replace_error(exc) or attempt == len(_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS) - 1:
+                raise
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+
+
+def _is_retryable_windows_replace_error(exc: OSError) -> bool:
+    if os.name != "nt":
+        return False
+    if isinstance(exc, PermissionError):
+        return getattr(exc, "winerror", None) in {5, 32}
+    return getattr(exc, "winerror", None) in {5, 32}
 
 
 class SessionStore:

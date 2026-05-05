@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -26,6 +27,7 @@ DEFAULT_STATE_PATH = Path(".tmp/local-ai-launcher/state.json")
 DEFAULT_POLL_SECONDS = 5.0
 STATUS_BOARD_REFRESH_SECONDS = 1.0
 RETRY_DELAYS_SECONDS = [0, 60, 300, 900, 1800, 1800]
+ATOMIC_REPLACE_RETRY_DELAYS_SECONDS = (0.0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1329,6 +1331,41 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp_path, path)
+    fd, temp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_path_with_retry(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _replace_path_with_retry(temp_path: str, path: Path) -> None:
+    last_error: OSError | None = None
+    for attempt, delay in enumerate(ATOMIC_REPLACE_RETRY_DELAYS_SECONDS):
+        try:
+            os.replace(temp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            if not _is_retryable_windows_replace_error(exc) or attempt == len(ATOMIC_REPLACE_RETRY_DELAYS_SECONDS) - 1:
+                raise
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+
+
+def _is_retryable_windows_replace_error(exc: OSError) -> bool:
+    if os.name != "nt":
+        return False
+    if isinstance(exc, PermissionError):
+        return getattr(exc, "winerror", None) in {5, 32}
+    return getattr(exc, "winerror", None) in {5, 32}

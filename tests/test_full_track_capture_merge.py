@@ -13,6 +13,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from local_meeting_ai_runtime.models import DelegateSession
+from local_meeting_ai_runtime.models import TranscriptChunk
 from local_meeting_ai_runtime.service import DelegateService
 from local_meeting_ai_runtime.storage import RunnerQueueStore, SessionStore
 
@@ -31,6 +32,17 @@ class _DummyAiClient:
 
     def release_quality_runtime_resources(self) -> None:
         return
+
+    def transcribe_audio_path_high_quality(self, **_: object) -> dict[str, object]:
+        return {
+            "chunks": [],
+            "provider": "faster_whisper_cuda",
+            "model": "large-v3",
+            "compute_type": "float16",
+            "diarization_provider": None,
+            "quality_pass": "final_offline_archive",
+            "dropped_segment_count": 0,
+        }
 
 
 class FullTrackCaptureMergeTest(unittest.TestCase):
@@ -216,6 +228,129 @@ class FullTrackCaptureMergeTest(unittest.TestCase):
             sys_info = sf.info(str(Path(merged["meeting_output_path"])))
             self.assertAlmostEqual(mic_info.duration, 1.0, places=2)
             self.assertAlmostEqual(sys_info.duration, 1.0, places=2)
+
+    def test_merge_audio_archives_still_builds_merged_tracks_for_long_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_service(temp_dir)
+            service._final_merged_transcription_max_seconds = 60.0
+            session = DelegateSession(
+                session_id="full-track-long-session",
+                delegate_mode="answer_on_ask",
+                bot_display_name="WooBIN_bot",
+                status="active",
+            )
+            audio_dir = Path(temp_dir) / "data" / "audio" / session.session_id
+            mic = audio_dir / "mic-full.wav"
+            sys = audio_dir / "sys-full.wav"
+            self._write_wav(mic, seconds=1.0)
+            self._write_wav(sys, seconds=1.0)
+            session.ai_state["full_track_capture_baseline"] = "2026-04-18T00:00:00+00:00"
+            session.ai_state["full_track_capture"] = {"strategy": "rolling_full_track"}
+            session.ai_state["full_track_archive_paths"] = [
+                {
+                    "path": str(mic),
+                    "audio_source": "microphone",
+                    "capture_sequence": 1,
+                    "session_start_offset_seconds": 0.0,
+                    "session_end_offset_seconds": 120.0,
+                    "seconds": 120.0,
+                    "created_at": "2026-04-18T00:02:00+00:00",
+                },
+                {
+                    "path": str(sys),
+                    "audio_source": "system",
+                    "capture_sequence": 2,
+                    "session_start_offset_seconds": 0.0,
+                    "session_end_offset_seconds": 120.0,
+                    "seconds": 120.0,
+                    "created_at": "2026-04-18T00:02:00+00:00",
+                },
+            ]
+
+            merged = service._merge_audio_archives_for_final_pass(session)
+
+            self.assertTrue(bool(merged["microphone_path"]))
+            self.assertTrue(bool(merged["meeting_output_path"]))
+            self.assertEqual(merged["archive_duration_seconds"], 120.0)
+
+    def test_archive_segment_transcription_splits_long_archive_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_service(temp_dir)
+            service._final_archive_transcription_chunk_seconds = 1.0
+            service._ai.quality_readiness = mock.Mock(  # type: ignore[method-assign]
+                return_value={
+                    "blocking_reasons": [],
+                    "provider": "faster_whisper_cuda",
+                    "model": "large-v3",
+                    "gpu_ready": True,
+                    "faster_whisper_ready": True,
+                    "pyannote_ready": True,
+                    "diarization_provider": "pyannote/test",
+                }
+            )
+            session = DelegateSession(
+                session_id="archive-split-session",
+                delegate_mode="answer_on_ask",
+                bot_display_name="WooBIN_bot",
+                status="active",
+            )
+            audio_dir = Path(temp_dir) / "data" / "audio" / session.session_id
+            system_path = audio_dir / "system-long.wav"
+            self._write_wav(system_path, seconds=2.4, channels=2)
+            calls: list[dict[str, object]] = []
+
+            def _fake_transcribe_audio_path_high_quality(**kwargs: object) -> dict[str, object]:
+                calls.append(dict(kwargs))
+                base = float(kwargs.get("session_offset_base_seconds") or 0.0)
+                return {
+                    "chunks": [
+                        TranscriptChunk(
+                            speaker="remote_participant",
+                            text=f"chunk-{len(calls)}",
+                            source=str(kwargs.get("source") or "meeting_output_final_offline"),
+                            metadata={
+                                "session_start_offset_seconds": round(base, 3),
+                                "session_end_offset_seconds": round(base + 0.4, 3),
+                            },
+                        )
+                    ],
+                    "provider": "faster_whisper_cuda",
+                    "model": "large-v3",
+                    "compute_type": "float16",
+                    "diarization_provider": "pyannote/test" if kwargs.get("enable_diarization") else None,
+                    "quality_pass": "final_offline_archive",
+                    "dropped_segment_count": 0,
+                }
+
+            service._ai.transcribe_audio_path_high_quality = _fake_transcribe_audio_path_high_quality  # type: ignore[method-assign]
+
+            result = service._transcribe_archived_audio_segments_for_final_pass(
+                session,
+                baseline_started_at="2026-04-18T00:00:00+00:00",
+                archives=[
+                    {
+                        "path": str(system_path),
+                        "audio_source": "system",
+                        "capture_sequence": 1,
+                        "session_start_offset_seconds": 10.0,
+                        "session_end_offset_seconds": 12.4,
+                        "seconds": 2.4,
+                        "created_at": "2026-04-18T00:00:02+00:00",
+                    }
+                ],
+            )
+
+            self.assertGreaterEqual(len(calls), 3)
+            self.assertEqual(
+                [round(float(call.get("session_offset_base_seconds") or 0.0), 3) for call in calls],
+                [10.0, 11.0, 12.0],
+            )
+            self.assertEqual(
+                [bool(call.get("enable_diarization")) for call in calls],
+                [True, True, False],
+            )
+            self.assertEqual(str(result.get("input_strategy") or ""), "archive_segments")
+            self.assertGreaterEqual(len(list(result.get("chunks") or [])), 1)
 
     def test_latest_audio_archive_at_considers_full_track_archives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -36,6 +36,7 @@ from .launcher_manager import (
     start_launcher as start_full_launcher,
     stop_launcher as stop_full_launcher,
 )
+from .meeting_trigger_watcher import read_watcher_status, run_watcher_loop, start_watcher, stop_watcher
 from .runtime_manager import (
     create_runtime_session,
     get_runtime_session,
@@ -294,6 +295,24 @@ def build_parser() -> argparse.ArgumentParser:
     stop_parser = subparsers.add_parser("stop", help="Stop the copied runtime process.")
     stop_parser.set_defaults(func=handle_stop)
 
+    watcher_start_parser = subparsers.add_parser(
+        "watcher-start",
+        help="Start the background Zoom meeting trigger watcher.",
+    )
+    watcher_start_parser.set_defaults(func=handle_watcher_start)
+
+    watcher_status_parser = subparsers.add_parser(
+        "watcher-status",
+        help="Show background Zoom meeting trigger watcher status.",
+    )
+    watcher_status_parser.set_defaults(func=handle_watcher_status)
+
+    watcher_stop_parser = subparsers.add_parser(
+        "watcher-stop",
+        help="Stop the background Zoom meeting trigger watcher.",
+    )
+    watcher_stop_parser.set_defaults(func=handle_watcher_stop)
+
     create_session_parser = subparsers.add_parser(
         "create-session",
         help="Create a meeting session from a Zoom link and passcode.",
@@ -482,6 +501,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     skill_clear_parser.set_defaults(func=handle_skill_clear)
 
+    watcher_loop_parser = subparsers.add_parser(
+        "_watcher-loop",
+        help=argparse.SUPPRESS,
+    )
+    watcher_loop_parser.set_defaults(func=handle_watcher_loop)
+
     return parser
 
 
@@ -573,6 +598,7 @@ def _handle_menu_show_status(config_path: Path) -> int:
     active_skill_label = _menu_active_skill_label(state)
     launcher_status: dict[str, Any] | None = None
     runtime_status: dict[str, Any] | None = None
+    watcher_status = read_watcher_status(config, config_path=config_path)
 
     try:
         if execution_mode == "launcher":
@@ -602,6 +628,7 @@ def _handle_menu_show_status(config_path: Path) -> int:
         print(f"  점검 항목 {len(startup_blockers)}개가 있습니다.")
     print(f"- 런처 상태: {'실행 중' if launcher_running else '중지됨' if execution_mode == 'launcher' else '사용 안 함'}")
     print(f"- Zoom 엔진 상태: {'실행 중' if runtime_alive else '중지됨'}")
+    print(f"- 회의 감지 watcher: {'실행 중' if bool(watcher_status.get('alive')) else '중지됨'}")
     if execution_mode == "launcher":
         if finalizer_enabled:
             print(f"- 결과물 마무리 엔진: {'실행 중' if finalizer_alive else '중지됨'}")
@@ -1642,6 +1669,31 @@ def handle_stop(args: argparse.Namespace) -> int:
         status = stop_runtime(config, config_path=args.config)
     print(json.dumps(_decorate_status_payload(config, args.config, status), ensure_ascii=False, indent=2))
     return 0
+
+
+def handle_watcher_start(args: argparse.Namespace) -> int:
+    config = _load_effective_config(args.config)
+    status = start_watcher(config, config_path=args.config)
+    print(json.dumps(status, ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_watcher_status(args: argparse.Namespace) -> int:
+    config = _load_effective_config(args.config)
+    status = read_watcher_status(config, config_path=args.config)
+    print(json.dumps(status, ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_watcher_stop(args: argparse.Namespace) -> int:
+    config = _load_effective_config(args.config)
+    status = stop_watcher(config, config_path=args.config)
+    print(json.dumps(status, ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_watcher_loop(args: argparse.Namespace) -> int:
+    return int(run_watcher_loop(config_path=Path(args.config)))
 
 
 def handle_create_session(args: argparse.Namespace) -> int:

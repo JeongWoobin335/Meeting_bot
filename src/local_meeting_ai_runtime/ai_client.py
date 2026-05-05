@@ -95,6 +95,19 @@ class AiDelegateClient:
             os.getenv("DELEGATE_RESULT_IMAGE_MCP_RESOLUTION", "4k").strip()
             or "4k"
         )
+        self._live_knowledge_mcp_enabled = self._env_bool("DELEGATE_LIVE_KNOWLEDGE_MCP_ENABLED", True)
+        self._live_knowledge_mcp_server_name = (
+            os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_SERVER_NAME", "notion-bot-knowledge").strip()
+            or "notion-bot-knowledge"
+        )
+        self._live_knowledge_mcp_tool_name = (
+            os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_TOOL_NAME", "handle_zoom_ax_turn").strip()
+            or "handle_zoom_ax_turn"
+        )
+        self._live_knowledge_mcp_timeout = max(
+            float(os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_TIMEOUT_SECONDS", "20")),
+            3.0,
+        )
         self._api_key = (
             os.getenv("DELEGATE_AI_API_KEY", "").strip()
             or os.getenv("OPENAI_API_KEY", "").strip()
@@ -232,6 +245,7 @@ class AiDelegateClient:
             os.getenv("DELEGATE_RESULT_IMAGE_REVIEW_TIMEOUT_SECONDS", "180")
         )
         self._result_image_mcp_server_config = self._resolve_result_image_mcp_server_config()
+        self._live_knowledge_mcp_server_config = self._resolve_live_knowledge_mcp_server_config()
         self._result_image_mcp_concurrency_loop: asyncio.AbstractEventLoop | None = None
         self._result_image_mcp_concurrency_semaphore: asyncio.Semaphore | None = None
         self._generated_meeting_output_skill: dict[str, object] | None = None
@@ -248,13 +262,120 @@ class AiDelegateClient:
         self._ensure_generated_meeting_output_skill(session)
         return self._codex_summarize(session)
 
-    async def draft_reply(self, session: DelegateSession, request_text: str) -> dict[str, Any]:
-        cleaned_request_text = str(request_text or "").strip()
-        if not cleaned_request_text:
+    async def respond_to_live_turn(
+        self,
+        session: DelegateSession,
+        *,
+        speaker: str,
+        text: str,
+        source: str,
+        direct_question: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        cleaned_text = str(text or "").strip()
+        cleaned_speaker = str(speaker or "").strip() or "participant"
+        cleaned_source = str(source or "").strip() or "meeting_input"
+        if not cleaned_text:
             raise ValueError("A live meeting request is required.")
+        tool_result: dict[str, Any] | None = None
+        tool_error = ""
+        if self._live_knowledge_mcp_ready:
+            try:
+                tool_result = await self._call_live_knowledge_mcp_turn(
+                    session,
+                    speaker=cleaned_speaker,
+                    text=cleaned_text,
+                    metadata=dict(metadata or {}),
+                )
+            except Exception as exc:
+                tool_error = str(exc).strip() or exc.__class__.__name__
+        if tool_result is not None:
+            should_reply = bool(tool_result.get("should_reply", False))
+            reply_text = str(tool_result.get("reply_text") or "").strip()
+            if should_reply and reply_text:
+                evidence_cards = list(tool_result.get("evidence_cards") or [])
+                judgment = dict(tool_result.get("judgment") or {})
+                return {
+                    "request_text": (
+                        f"Current participant message from {cleaned_speaker}: {cleaned_text}"
+                        if cleaned_speaker
+                        else f"Current participant message: {cleaned_text}"
+                    ),
+                    "draft": reply_text,
+                    "confidence_note": str(judgment.get("reason") or "").strip(),
+                    "grounding_summary": self._summarize_live_knowledge_evidence(evidence_cards),
+                    "tool_usage_summary": (
+                        f"{self._live_knowledge_mcp_server_name}.{self._live_knowledge_mcp_tool_name}"
+                    ),
+                    "provider": self._live_knowledge_mcp_server_name,
+                    "response_mode": "shared_live_core_mcp",
+                    "trigger": "semantic_tool_reply",
+                    "tool_result": tool_result,
+                    "should_reply": True,
+                }
+            if not direct_question:
+                return {
+                    "request_text": (
+                        f"Current participant message from {cleaned_speaker}: {cleaned_text}"
+                        if cleaned_speaker
+                        else f"Current participant message: {cleaned_text}"
+                    ),
+                    "draft": "",
+                    "confidence_note": str(dict(tool_result.get("judgment") or {}).get("reason") or "").strip(),
+                    "grounding_summary": "",
+                    "tool_usage_summary": (
+                        f"{self._live_knowledge_mcp_server_name}.{self._live_knowledge_mcp_tool_name}: no reply"
+                    ),
+                    "provider": self._live_knowledge_mcp_server_name,
+                    "response_mode": "shared_live_core_mcp",
+                    "tool_result": tool_result,
+                    "should_reply": False,
+                    "ignore_reason": "The live knowledge MCP decided not to answer this turn.",
+                }
+        if tool_error and not direct_question:
+            return {
+                "request_text": (
+                    f"Current participant message from {cleaned_speaker}: {cleaned_text}"
+                    if cleaned_speaker
+                    else f"Current participant message: {cleaned_text}"
+                ),
+                "draft": "",
+                "confidence_note": tool_error,
+                "grounding_summary": "",
+                "tool_usage_summary": f"{self._live_knowledge_mcp_server_name}: unavailable",
+                "provider": self._live_knowledge_mcp_server_name,
+                "response_mode": "shared_live_core_mcp",
+                "should_reply": False,
+                "ignore_reason": "The live knowledge MCP route was unavailable for this non-direct turn.",
+            }
         if not self._codex_ready:
+            if not direct_question:
+                return {
+                    "request_text": (
+                        f"Current participant message from {cleaned_speaker}: {cleaned_text}"
+                        if cleaned_speaker
+                        else f"Current participant message: {cleaned_text}"
+                    ),
+                    "draft": "",
+                    "confidence_note": "The local Codex body is unavailable.",
+                    "grounding_summary": "",
+                    "tool_usage_summary": "local Codex unavailable",
+                    "provider": "codex_exec",
+                    "response_mode": "shared_live_core",
+                    "should_reply": False,
+                    "ignore_reason": "No live tool answer was available for this non-direct turn.",
+                }
             raise RuntimeError("The local Codex body is unavailable for live meeting replies.")
-        return self._codex_draft_reply(session, cleaned_request_text)
+        return self._codex_respond_to_live_turn(
+            session,
+            speaker=cleaned_speaker,
+            text=cleaned_text,
+            source=cleaned_source,
+            direct_question=bool(direct_question),
+            metadata=dict(metadata or {}),
+            tool_result=tool_result,
+            tool_error=tool_error,
+        )
 
     async def materialize_result_generation(
         self,
@@ -770,27 +891,67 @@ class AiDelegateClient:
             "provider": "codex_exec",
         }
 
-    def _codex_draft_reply(self, session: DelegateSession, request_text: str) -> dict[str, Any]:
-        request_payload = (
-            "Task: answer the participant's current meeting message as the same local AI body present in this meeting.\n"
-            "Keep the reply grounded in the session memory and assistant presence facts below.\n"
+    def _codex_respond_to_live_turn(
+        self,
+        session: DelegateSession,
+        *,
+        speaker: str,
+        text: str,
+        source: str,
+        direct_question: bool,
+        metadata: dict[str, Any],
+        tool_result: dict[str, Any] | None = None,
+        tool_error: str = "",
+    ) -> dict[str, Any]:
+        live_input = {
+            "speaker": speaker,
+            "text": text,
+            "source": source,
+            "direct_question": bool(direct_question),
+            "metadata": dict(metadata or {}),
+        }
+        tool_invocation_context = {
+            "live_knowledge_mcp": {
+                "server": self._live_knowledge_mcp_server_name,
+                "tool": self._live_knowledge_mcp_tool_name,
+                "result": tool_result,
+                "error": tool_error,
+            }
+        }
+        request_text = (
+            f"Current participant message from {speaker}: {text}"
+            if speaker
+            else f"Current participant message: {text}"
+        )
+        prompt_text = (
+            "Task: answer the participant's current live meeting input as the same local AI body present in this meeting.\n"
+            "You are not a Zoom-only mini bot. You are the same local AI body the user normally works with, now speaking through the meeting participant shell.\n"
+            "Keep the reply grounded in the meeting memory and assistant presence facts below.\n"
+            "Use the same local Codex capabilities, configured tools, and connected MCP routes that are available in this environment whenever they are genuinely needed.\n"
+            "Treat the tool-layer payload below as the current live-core tool belt for this same local AI body.\n"
+            "Do not use tools or MCPs just because they exist; use them only when they materially improve the answer.\n"
+            "If the visible meeting memory is already enough, answer directly without unnecessary tool use.\n"
             "Use natural Korean.\n"
             "Do not mention internal mode names, payload keys, runtime field names, or system flags unless the participant explicitly asks for technical debugging.\n"
-            "Required JSON keys: `draft` and `confidence_note`.\n\n"
-            f"Session payload:\n{self._reply_context_json(session)}\n\n"
-            f"Current participant request:\n{request_text}"
+            "Required JSON keys: `draft`, `confidence_note`, `grounding_summary`, and `tool_usage_summary`.\n\n"
+            f"Session payload:\n{self._live_interaction_context_json(session)}\n\n"
+            f"Tool layer payload:\n{json.dumps(self._shared_tool_layer_payload(), ensure_ascii=False, indent=2)}\n\n"
+            f"Tool invocation context:\n{json.dumps(tool_invocation_context, ensure_ascii=False, indent=2)}\n\n"
+            f"Current live input:\n{json.dumps(live_input, ensure_ascii=False, indent=2)}"
         )
         parsed = self._codex_json_response(
             session,
-            request_payload,
+            prompt_text,
             schema={
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
                     "draft": {"type": "string"},
                     "confidence_note": {"type": "string"},
+                    "grounding_summary": {"type": "string"},
+                    "tool_usage_summary": {"type": "string"},
                 },
-                "required": ["draft", "confidence_note"],
+                "required": ["draft", "confidence_note", "grounding_summary", "tool_usage_summary"],
             },
             timeout_seconds=max(self._timeout, self._reply_timeout),
         )
@@ -801,7 +962,10 @@ class AiDelegateClient:
             "request_text": request_text,
             "draft": draft,
             "confidence_note": str(parsed.get("confidence_note") or "").strip(),
+            "grounding_summary": str(parsed.get("grounding_summary") or "").strip(),
+            "tool_usage_summary": str(parsed.get("tool_usage_summary") or "").strip(),
             "provider": "codex_exec",
+            "response_mode": "shared_live_core",
         }
 
     async def _openai_transcribe(self, input_path: Path) -> dict[str, Any] | str:
@@ -866,6 +1030,67 @@ class AiDelegateClient:
             except json.JSONDecodeError:
                 return {}
         return {}
+
+    def _normalize_codex_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        def _normalize(node: Any) -> Any:
+            if isinstance(node, list):
+                return [_normalize(item) for item in node]
+            if not isinstance(node, dict):
+                return node
+            normalized = {key: _normalize(value) for key, value in node.items()}
+            if normalized.get("type") == "object" or "properties" in normalized:
+                normalized.setdefault("additionalProperties", False)
+                properties = normalized.get("properties")
+                if isinstance(properties, dict) and properties:
+                    existing_required = [
+                        str(item).strip()
+                        for item in list(normalized.get("required") or [])
+                        if str(item).strip()
+                    ]
+                    for key in properties.keys():
+                        if key not in existing_required:
+                            existing_required.append(str(key))
+                    normalized["required"] = existing_required
+            return normalized
+
+        normalized = _normalize(schema)
+        return normalized if isinstance(normalized, dict) else dict(schema)
+
+    def _extract_codex_error_message(self, stdout_text: str, stderr_text: str) -> str:
+        for raw_line in (stdout_text or "").splitlines():
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            message = ""
+            if event.get("type") == "error":
+                message = str(event.get("message") or "").strip()
+            elif event.get("type") == "turn.failed":
+                message = str(dict(event.get("error") or {}).get("message") or "").strip()
+            compact = self._compact_codex_error_message(message)
+            if compact:
+                return compact
+        return (stderr_text or "").strip() or (stdout_text or "").strip()
+
+    def _compact_codex_error_message(self, message: str) -> str:
+        text = str(message or "").strip()
+        if not text:
+            return ""
+        parsed = self._parse_json_text(text)
+        if parsed.get("type") == "error":
+            error = dict(parsed.get("error") or {})
+            pieces = [
+                str(error.get("code") or "").strip(),
+                str(error.get("message") or "").strip(),
+            ]
+            compact = ": ".join(part for part in pieces if part)
+            return compact or text
+        return text
 
     def _apply_resolved_renderer_theme(self, session: DelegateSession) -> None:
         state = dict(session.ai_state.get("meeting_output_skill") or {})
@@ -2125,6 +2350,123 @@ class AiDelegateClient:
             raise RuntimeError("The local image-generation step returned no written image files.")
         return written_paths
 
+    async def _call_live_knowledge_mcp_turn(
+        self,
+        session: DelegateSession,
+        *,
+        speaker: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self._live_knowledge_mcp_server_config or not self._live_knowledge_mcp_ready:
+            raise RuntimeError("The live knowledge MCP route is unavailable.")
+        server = dict(self._live_knowledge_mcp_server_config or {})
+        env = dict(os.environ)
+        env.update({key: str(value) for key, value in dict(server.get("env") or {}).items()})
+        arguments: dict[str, Any] = {"text": text}
+        if speaker:
+            arguments["speaker"] = speaker
+        meeting_id = (
+            str(session.meeting_id or "").strip()
+            or str(session.meeting_uuid or "").strip()
+            or str(session.meeting_number or "").strip()
+            or str(session.session_id or "").strip()
+        )
+        if meeting_id:
+            arguments["meeting_id"] = meeting_id
+        chat_id = (
+            str(metadata.get("chat_id") or "").strip()
+            or str(metadata.get("id") or "").strip()
+            or str(metadata.get("message_id") or "").strip()
+        )
+        if chat_id:
+            arguments["chat_id"] = chat_id
+        server_params = StdioServerParameters(
+            command=str(server.get("command") or "").strip(),
+            args=[str(item) for item in list(server.get("args") or []) if str(item or "").strip()],
+            cwd=str(server.get("cwd") or "").strip() or str(self._codex_workdir),
+            env=env,
+        )
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as mcp_session:
+                async with asyncio.timeout(self._live_knowledge_mcp_timeout):
+                    await mcp_session.initialize()
+                    await self._ensure_mcp_tool(
+                        mcp_session,
+                        self._live_knowledge_mcp_tool_name,
+                        route_name=self._live_knowledge_mcp_server_name,
+                    )
+                result = await mcp_session.call_tool(
+                    self._live_knowledge_mcp_tool_name,
+                    arguments=arguments,
+                    read_timeout_seconds=timedelta(seconds=self._live_knowledge_mcp_timeout),
+                )
+                return self._parse_mcp_json_result(result, tool_name=self._live_knowledge_mcp_tool_name)
+
+    async def _ensure_mcp_tool(self, mcp_session: ClientSession, tool_name: str, *, route_name: str) -> None:
+        tools_result = await mcp_session.list_tools()
+        available = {
+            str(getattr(tool, "name", "") or "").strip()
+            for tool in list(getattr(tools_result, "tools", []) or [])
+            if str(getattr(tool, "name", "") or "").strip()
+        }
+        if tool_name not in available:
+            raise RuntimeError(f"The local MCP route `{route_name}` does not expose `{tool_name}`.")
+
+    def _parse_mcp_json_result(self, result: Any, *, tool_name: str) -> dict[str, Any]:
+        self._raise_for_mcp_error(result, tool_name=tool_name)
+        structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
+        if isinstance(structured, dict):
+            return dict(structured)
+        content = getattr(result, "content", None) or []
+        text_parts: list[str] = []
+        for item in list(content):
+            text = str(getattr(item, "text", "") or "").strip()
+            if text:
+                text_parts.append(text)
+        joined = "\n".join(text_parts).strip()
+        if not joined:
+            return {}
+        try:
+            parsed = json.loads(joined)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"The local MCP tool `{tool_name}` returned non-JSON content.") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"The local MCP tool `{tool_name}` returned JSON that is not an object.")
+        return dict(parsed)
+
+    def _raise_for_mcp_error(self, result: Any, *, tool_name: str) -> None:
+        is_error = bool(getattr(result, "isError", False) or getattr(result, "is_error", False))
+        if not is_error:
+            return
+        structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
+        detail_parts: list[str] = []
+        if isinstance(structured, dict):
+            for key in ("error", "message", "detail", "note"):
+                text = str(structured.get(key) or "").strip()
+                if text:
+                    detail_parts.append(text)
+        content = getattr(result, "content", None) or []
+        for item in list(content):
+            text = str(getattr(item, "text", "") or "").strip()
+            if text:
+                detail_parts.append(text)
+        detail = "; ".join(detail_parts).strip() or "unknown MCP error"
+        raise RuntimeError(f"The local MCP tool `{tool_name}` returned an error: {detail}")
+
+    def _summarize_live_knowledge_evidence(self, evidence_cards: list[Any]) -> str:
+        cards = [item for item in list(evidence_cards or []) if isinstance(item, dict)]
+        if not cards:
+            return "notion_bot returned an answer without explicit evidence cards."
+        summaries = [
+            str(item.get("knowledge_id") or item.get("summary") or "").strip()
+            for item in cards[:3]
+            if str(item.get("knowledge_id") or item.get("summary") or "").strip()
+        ]
+        if not summaries:
+            return f"notion_bot returned {len(cards)} evidence card(s)."
+        return "notion_bot evidence: " + ", ".join(summaries)
+
     async def _generate_result_images_with_nanobanana_mcp(
         self,
         session: DelegateSession,
@@ -2692,6 +3034,7 @@ class AiDelegateClient:
                 "bot_display_name": session.bot_display_name,
                 "status": session.status,
             },
+            "tool_layer": self._shared_tool_layer_payload(),
             "summary_packet": session.summary_packet,
             "recent_transcript": [chunk.to_dict() for chunk in transcript],
             "recent_chat_history": [turn.to_dict() for turn in chat_history],
@@ -2699,17 +3042,21 @@ class AiDelegateClient:
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _reply_context_json(self, session: DelegateSession) -> str:
+    def _live_interaction_context_json(self, session: DelegateSession) -> str:
         audio_observer_state = dict(session.ai_state.get("audio_observer") or {})
         final_transcription_state = dict(session.ai_state.get("final_transcription") or {})
-        transcript = [chunk.to_dict() for chunk in session.transcript]
-        chat_history = [turn.to_dict() for turn in session.chat_history]
+        transcript = [chunk.to_dict() for chunk in session.transcript[-20:]]
+        chat_history = [turn.to_dict() for turn in session.chat_history[-20:]]
+        workspace_events = [item.to_dict() for item in session.workspace_events[-12:]]
         payload = {
             "meeting": {
                 "topic": session.meeting_topic,
+                "delegate_mode": session.delegate_mode,
                 "bot_display_name": session.bot_display_name,
                 "status": session.status,
+                "requested_by": session.requested_by,
             },
+            "tool_layer": self._shared_tool_layer_payload(),
             "assistant_presence": {
                 "role_description": self._assistant_role_description(session),
                 "collection_scope": self._assistant_collection_scope(session),
@@ -2720,12 +3067,95 @@ class AiDelegateClient:
                 ),
             },
             "meeting_memory": {
+                "summary_packet": session.summary_packet,
                 "transcript": transcript,
                 "chat_history": chat_history,
+                "workspace_events": workspace_events,
             },
             "instructions": session.instructions,
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _shared_tool_layer_payload(self) -> dict[str, Any]:
+        codex_routes = self._configured_codex_mcp_routes()
+        cursor_routes = self._configured_cursor_mcp_routes()
+        direct_routes: list[dict[str, Any]] = []
+        if self._result_image_mcp_ready:
+            direct_routes.append(
+                {
+                    "name": self._result_image_mcp_server_name,
+                    "source": "runtime_direct",
+                    "enabled": True,
+                    "notes": "Direct stdio MCP route available inside the local runtime.",
+                }
+            )
+        if self._live_knowledge_mcp_ready:
+            direct_routes.append(
+                {
+                    "name": self._live_knowledge_mcp_server_name,
+                    "source": "runtime_direct",
+                    "enabled": True,
+                    "tool": self._live_knowledge_mcp_tool_name,
+                    "notes": "Direct stdio MCP route available for live meeting knowledge turns.",
+                }
+            )
+        return {
+            "codex_exec": {
+                "available": self._codex_ready,
+                "workdir": str(self._codex_workdir),
+                "reachable_mcp_routes": codex_routes,
+            },
+            "runtime_direct_mcp_routes": direct_routes,
+            "other_local_mcp_catalog": {
+                "cursor_config_routes": cursor_routes,
+            },
+        }
+
+    def _configured_codex_mcp_routes(self) -> list[dict[str, Any]]:
+        config_path = Path.home() / ".codex" / "config.toml"
+        if tomllib is None or not config_path.exists():
+            return []
+        try:
+            payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        servers = payload.get("mcp_servers")
+        if not isinstance(servers, dict):
+            return []
+        return self._sanitize_mcp_route_catalog(servers, source="codex_config")
+
+    def _configured_cursor_mcp_routes(self) -> list[dict[str, Any]]:
+        config_path = Path.home() / ".cursor" / "mcp.json"
+        if not config_path.exists():
+            return []
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        servers = payload.get("mcpServers")
+        if not isinstance(servers, dict):
+            return []
+        return self._sanitize_mcp_route_catalog(servers, source="cursor_config")
+
+    def _sanitize_mcp_route_catalog(self, servers: dict[str, Any], *, source: str) -> list[dict[str, Any]]:
+        catalog: list[dict[str, Any]] = []
+        for name, raw_entry in servers.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            enabled = bool(raw_entry.get("enabled", True))
+            command = str(raw_entry.get("command") or "").strip()
+            args = [str(item) for item in list(raw_entry.get("args") or []) if str(item or "").strip()]
+            catalog.append(
+                {
+                    "name": str(name).strip(),
+                    "source": source,
+                    "enabled": enabled,
+                    "command": command,
+                    "args_preview": args[:4],
+                }
+            )
+        catalog.sort(key=lambda item: (0 if item.get("enabled") else 1, str(item.get("name") or "").lower()))
+        return catalog
 
     def _assistant_role_description(self, session: DelegateSession) -> str:
         topic = str(session.meeting_topic or "이 회의").strip() or "이 회의"
@@ -2829,9 +3259,10 @@ class AiDelegateClient:
         schema_path: Path | None = None
         try:
             if schema is not None:
+                normalized_schema = self._normalize_codex_schema(schema)
                 with tempfile.NamedTemporaryFile(prefix="delegate-codex-schema-", suffix=".json", delete=False) as handle:
                     schema_path = Path(handle.name)
-                schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+                schema_path.write_text(json.dumps(normalized_schema, ensure_ascii=False, indent=2), encoding="utf-8")
             attempts = [request_text]
             if schema is not None:
                 attempts.append(
@@ -2858,7 +3289,7 @@ class AiDelegateClient:
                     timeout=timeout_seconds or self._timeout,
                 )
                 if completed.returncode != 0:
-                    last_error = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+                    last_error = self._extract_codex_error_message(completed.stdout, completed.stderr) or f"exit code {completed.returncode}"
                     continue
                 if reuse_thread:
                     session.ai_state.update(self._extract_codex_session_state(completed.stdout))
@@ -3021,6 +3452,16 @@ class AiDelegateClient:
             and stdio_client is not None
         )
 
+    @property
+    def _live_knowledge_mcp_ready(self) -> bool:
+        return bool(
+            self._live_knowledge_mcp_enabled
+            and self._live_knowledge_mcp_server_config
+            and ClientSession is not None
+            and StdioServerParameters is not None
+            and stdio_client is not None
+        )
+
     def _resolve_result_image_mcp_server_config(self) -> dict[str, Any] | None:
         command_override = os.getenv("DELEGATE_RESULT_IMAGE_MCP_COMMAND", "").strip()
         if command_override:
@@ -3035,6 +3476,63 @@ class AiDelegateClient:
         if resolved:
             return resolved
         return self._resolve_result_image_mcp_server_from_cursor_config()
+
+    def _resolve_live_knowledge_mcp_server_config(self) -> dict[str, Any] | None:
+        if not self._live_knowledge_mcp_enabled:
+            return None
+        command_override = os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_COMMAND", "").strip()
+        if command_override:
+            return {
+                "command": command_override,
+                "args": self._parse_result_image_mcp_args(
+                    os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_ARGS", "").strip()
+                ),
+                "env": self._parse_result_image_mcp_env(
+                    os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_ENV", "").strip()
+                ),
+                "cwd": str(os.getenv("DELEGATE_LIVE_KNOWLEDGE_MCP_CWD", "").strip() or self._codex_workdir),
+                "source": "env_override",
+            }
+        resolved = self._resolve_named_mcp_server_from_codex_config(self._live_knowledge_mcp_server_name)
+        if resolved:
+            return resolved
+        return self._resolve_named_mcp_server_from_cursor_config(self._live_knowledge_mcp_server_name)
+
+    def _resolve_named_mcp_server_from_codex_config(self, server_name: str) -> dict[str, Any] | None:
+        config_path = Path.home() / ".codex" / "config.toml"
+        if tomllib is None or not config_path.exists():
+            return None
+        try:
+            payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        servers = payload.get("mcp_servers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
+        return self._normalize_result_image_mcp_server_entry(
+            entry,
+            source=f"codex:{server_name}",
+            base_dir=config_path.parent,
+        )
+
+    def _resolve_named_mcp_server_from_cursor_config(self, server_name: str) -> dict[str, Any] | None:
+        config_path = Path.home() / ".cursor" / "mcp.json"
+        if not config_path.exists():
+            return None
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        servers = payload.get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
+        return self._normalize_result_image_mcp_server_entry(
+            entry,
+            source=f"cursor:{server_name}",
+            base_dir=config_path.parent,
+        )
 
     def _resolve_result_image_mcp_server_from_codex_config(self) -> dict[str, Any] | None:
         config_path = Path.home() / ".codex" / "config.toml"

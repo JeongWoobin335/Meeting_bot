@@ -591,6 +591,31 @@ def create_app(
         return String(value || "").replace(/\\s+/g, " ").trim();
       }}
 
+      function formatChatMessage(value) {{
+        const normalized = String(value || "").replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
+        const lines = normalized.split("\\n").map((line) => line.replace(/[^\\S\\n]+/g, " ").trim());
+        const cleaned = [];
+        let previousBlank = false;
+        for (const line of lines) {{
+          if (!line) {{
+            if (!previousBlank && cleaned.length) {{
+              cleaned.push("");
+            }}
+            previousBlank = true;
+            continue;
+          }}
+          cleaned.push(line);
+          previousBlank = false;
+        }}
+        while (cleaned.length && !cleaned[0]) {{
+          cleaned.shift();
+        }}
+        while (cleaned.length && !cleaned[cleaned.length - 1]) {{
+          cleaned.pop();
+        }}
+        return cleaned.join("\\n");
+      }}
+
       function parseZoomTimestampMs(value) {{
         if (value === null || value === undefined) {{
           return null;
@@ -688,8 +713,8 @@ def create_app(
         if (!runtimeState.client || typeof runtimeState.client.sendChat !== "function") {{
           return;
         }}
-        const draft = compactText(reply.draft);
-        const replyKey = String(reply.reply_key || draft.toLowerCase()).trim().toLowerCase();
+        const draft = formatChatMessage(reply.draft);
+        const replyKey = String(reply.reply_key || compactText(draft).toLowerCase()).trim().toLowerCase();
         if (!draft || runtimeState.publishedReplyKeys.has(replyKey)) {{
           return;
         }}
@@ -705,7 +730,11 @@ def create_app(
               metadata: {{
                 status: "sent",
                 trigger: reply.trigger || "direct_question",
-                provider: reply.provider || "codex_exec"
+                provider: reply.provider || "codex_exec",
+                response_mode: reply.response_mode || "shared_live_core",
+                confidence_note: reply.confidence_note || "",
+                grounding_summary: reply.grounding_summary || "",
+                tool_usage_summary: reply.tool_usage_summary || ""
               }}
             }}
           ]);

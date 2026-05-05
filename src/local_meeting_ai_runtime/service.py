@@ -13,6 +13,7 @@ import queue
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -100,6 +101,14 @@ class DelegateService:
         self._continuous_full_track_chunk_seconds = max(
             self._env_float("DELEGATE_CONTINUOUS_FULL_TRACK_CHUNK_SECONDS", 45.0),
             5.0,
+        )
+        self._final_archive_transcription_chunk_seconds = max(
+            self._env_float("DELEGATE_FINAL_ARCHIVE_TRANSCRIPTION_CHUNK_SECONDS", 60.0),
+            60.0,
+        )
+        self._final_merged_transcription_max_seconds = max(
+            self._env_float("DELEGATE_FINAL_MERGED_TRANSCRIPTION_MAX_SECONDS", 5400.0),
+            300.0,
         )
         self._windows_audio_helper_backend = self._env_bool("DELEGATE_WINDOWS_AUDIO_HELPER_BACKEND", True)
         self._session_heartbeat_timeout_seconds = max(
@@ -1145,6 +1154,8 @@ class DelegateService:
             str(manifest_path),
             "--log-path",
             str(log_path),
+            "--chunk-seconds",
+            str(float(control.get("full_track_chunk_seconds") or 0.0)),
         ]
         if microphone_device_name:
             helper_args.extend(["--microphone-device", microphone_device_name])
@@ -1195,38 +1206,60 @@ class DelegateService:
             microphone_track = dict(manifest.get("microphone") or {})
             system_track = dict(manifest.get("system") or {})
             captured_at = str(manifest.get("stopped_at") or utcnow_iso()).strip() or utcnow_iso()
-            if not microphone_track.get("path") or not system_track.get("path"):
+            microphone_segments = self._windows_helper_track_segments(
+                microphone_track,
+                fallback_captured_at=captured_at,
+            )
+            system_segments = self._windows_helper_track_segments(
+                system_track,
+                fallback_captured_at=captured_at,
+            )
+            if not microphone_segments or not system_segments:
                 raise LocalObserverError("Windows audio helper manifest did not include both microphone and system tracks.")
+            if len(microphone_segments) != len(system_segments):
+                raise LocalObserverError("Windows audio helper manifest included mismatched microphone/system segment counts.")
 
             observed_session = self._require_session(session_id)
-            observed_session = self._process_full_track_observations(
+            for microphone_segment, system_segment in zip(microphone_segments, system_segments):
+                observed_session = self._process_full_track_observations(
+                    observed_session,
+                    microphone_observation=self._build_windows_full_track_observation(
+                        path=microphone_segment.get("path"),
+                        source="microphone",
+                        capture_mode="full_track_microphone",
+                        sample_rate=int(microphone_segment.get("sample_rate") or self._observer._audio_sample_rate),
+                        seconds=float(microphone_segment.get("seconds") or 0.0),
+                        channels=int(microphone_segment.get("channels") or 1),
+                        device_name=str(microphone_segment.get("device_name") or microphone_device_name),
+                        captured_at=str(microphone_segment.get("captured_at") or captured_at),
+                    ),
+                    system_observation=self._build_windows_full_track_observation(
+                        path=system_segment.get("path"),
+                        source="system",
+                        capture_mode="full_track_system_audio",
+                        sample_rate=int(system_segment.get("sample_rate") or self._observer._audio_sample_rate),
+                        seconds=float(system_segment.get("seconds") or 0.0),
+                        channels=int(system_segment.get("channels") or 1),
+                        device_name=str(system_segment.get("device_name") or system_device_name),
+                        captured_at=str(system_segment.get("captured_at") or captured_at),
+                    ),
+                )
+            archived_full_track = self._sorted_audio_archives(
                 observed_session,
-                microphone_observation=self._build_windows_full_track_observation(
-                    path=microphone_track.get("path"),
-                    source="microphone",
-                    capture_mode="full_track_microphone",
-                    sample_rate=int(microphone_track.get("sample_rate") or self._observer._audio_sample_rate),
-                    seconds=float(microphone_track.get("seconds") or 0.0),
-                    channels=int(microphone_track.get("channels") or 1),
-                    device_name=str(microphone_track.get("device_name") or microphone_device_name),
-                    captured_at=captured_at,
-                ),
-                system_observation=self._build_windows_full_track_observation(
-                    path=system_track.get("path"),
-                    source="system",
-                    capture_mode="full_track_system_audio",
-                    sample_rate=int(system_track.get("sample_rate") or self._observer._audio_sample_rate),
-                    seconds=float(system_track.get("seconds") or 0.0),
-                    channels=int(system_track.get("channels") or 1),
-                    device_name=str(system_track.get("device_name") or system_device_name),
-                    captured_at=captured_at,
-                ),
+                archive_key="full_track_archive_paths",
+            )
+            chunk_count = len(
+                [
+                    item
+                    for item in archived_full_track
+                    if str(item.get("audio_source") or "").strip().lower() == "microphone"
+                ]
             )
             observed_session.ai_state["full_track_capture"] = {
                 **dict(observed_session.ai_state.get("full_track_capture") or {}),
                 "running": True,
                 "strategy": "windows_native_full_track",
-                "chunks": int(dict(observed_session.ai_state.get("full_track_capture") or {}).get("chunks") or 0),
+                "chunks": chunk_count,
                 "last_archived_at": captured_at,
                 "helper_log_path": str(log_path),
                 "manifest_path": str(manifest_path),
@@ -2408,15 +2441,67 @@ class DelegateService:
                 pass
             await asyncio.sleep(self._session_watchdog_poll_seconds)
 
-    def _windows_helper_orphan_signature(self, microphone_path: Path, system_path: Path) -> str:
-        microphone_stat = microphone_path.stat()
-        system_stat = system_path.stat()
-        return "|".join(
-            [
-                f"microphone:{microphone_stat.st_size}:{int(microphone_stat.st_mtime_ns)}",
-                f"system:{system_stat.st_size}:{int(system_stat.st_mtime_ns)}",
-            ]
-        )
+    def _windows_helper_orphan_paths(self, helper_dir: Path) -> tuple[list[Path], list[Path]]:
+        microphone_path = helper_dir / "microphone-full-track.wav"
+        system_path = helper_dir / "system-full-track.wav"
+        if microphone_path.exists() and system_path.exists():
+            return [microphone_path], [system_path]
+        microphone_segments = sorted(helper_dir.glob("microphone-full-track-*.wav"))
+        system_segments = sorted(helper_dir.glob("system-full-track-*.wav"))
+        return microphone_segments, system_segments
+
+    def _windows_helper_orphan_signature(self, microphone_paths: list[Path], system_paths: list[Path]) -> str:
+        parts: list[str] = []
+        for index, path in enumerate(microphone_paths, start=1):
+            stat = path.stat()
+            parts.append(f"microphone-{index}:{stat.st_size}:{int(stat.st_mtime_ns)}")
+        for index, path in enumerate(system_paths, start=1):
+            stat = path.stat()
+            parts.append(f"system-{index}:{stat.st_size}:{int(stat.st_mtime_ns)}")
+        return "|".join(parts)
+
+    def _windows_helper_track_segments(
+        self,
+        track: dict[str, Any],
+        *,
+        fallback_captured_at: str,
+    ) -> list[dict[str, Any]]:
+        segments: list[dict[str, Any]] = []
+        for index, item in enumerate(list(track.get("segments") or []), start=1):
+            payload = dict(item or {})
+            path = str(payload.get("path") or "").strip()
+            if not path:
+                continue
+            segments.append(
+                {
+                    "path": path,
+                    "sample_rate": int(payload.get("sample_rate") or track.get("sample_rate") or self._observer._audio_sample_rate),
+                    "seconds": max(float(payload.get("seconds") or 0.0), 0.0),
+                    "channels": max(int(payload.get("channels") or track.get("channels") or 1), 1),
+                    "device_name": str(payload.get("device_name") or track.get("device_name") or "").strip(),
+                    "captured_at": str(payload.get("stopped_at") or payload.get("captured_at") or fallback_captured_at).strip()
+                    or fallback_captured_at,
+                    "sequence": int(payload.get("sequence") or index),
+                }
+            )
+        if segments:
+            segments.sort(key=lambda item: (int(item.get("sequence") or 0), str(item.get("path") or "")))
+            return segments
+
+        legacy_path = str(track.get("path") or "").strip()
+        if not legacy_path:
+            return []
+        return [
+            {
+                "path": legacy_path,
+                "sample_rate": int(track.get("sample_rate") or self._observer._audio_sample_rate),
+                "seconds": max(float(track.get("seconds") or 0.0), 0.0),
+                "channels": max(int(track.get("channels") or 1), 1),
+                "device_name": str(track.get("device_name") or "").strip(),
+                "captured_at": fallback_captured_at,
+                "sequence": 1,
+            }
+        ]
 
     def _salvage_orphan_windows_helper_output(self, session: DelegateSession) -> tuple[DelegateSession, bool]:
         full_track_state = dict(session.ai_state.get("full_track_capture") or {})
@@ -2428,18 +2513,19 @@ class DelegateService:
         helper_dir = Path(getattr(self._observer, "_artifact_dir", ".tmp/local-observer")) / (
             f"windows-audio-helper-{session.session_id}"
         )
-        microphone_path = helper_dir / "microphone-full-track.wav"
-        system_path = helper_dir / "system-full-track.wav"
         manifest_path = helper_dir / "capture-manifest.json"
         log_path = helper_dir / "capture.log"
         if manifest_path.exists():
             return session, False
-        if not microphone_path.exists() or not system_path.exists():
+        microphone_paths, system_paths = self._windows_helper_orphan_paths(helper_dir)
+        if not microphone_paths or not system_paths:
             return session, False
-        if microphone_path.stat().st_size <= 0 or system_path.stat().st_size <= 0:
+        if len(microphone_paths) != len(system_paths):
+            return session, False
+        if any(path.stat().st_size <= 0 for path in [*microphone_paths, *system_paths]):
             return session, False
 
-        signature = self._windows_helper_orphan_signature(microphone_path, system_path)
+        signature = self._windows_helper_orphan_signature(microphone_paths, system_paths)
         recovery_state = dict(session.ai_state.get("audio_observer_recovery") or {})
         salvaged_signatures = [
             str(item).strip()
@@ -2452,55 +2538,69 @@ class DelegateService:
         import soundfile as sf
 
         try:
-            microphone_info = sf.info(str(microphone_path))
-            system_info = sf.info(str(system_path))
+            microphone_infos = [sf.info(str(path)) for path in microphone_paths]
+            system_infos = [sf.info(str(path)) for path in system_paths]
         except Exception:
             return session, False
 
-        captured_timestamp = max(microphone_path.stat().st_mtime, system_path.stat().st_mtime)
-        captured_at = datetime.fromtimestamp(captured_timestamp, tz=timezone.utc).astimezone().isoformat()
-        session = self._process_full_track_observations(
-            session,
-            microphone_observation=self._build_windows_full_track_observation(
-                path=microphone_path,
-                source="microphone",
-                capture_mode="full_track_microphone",
-                sample_rate=int(microphone_info.samplerate),
-                seconds=max(float(microphone_info.duration), 0.0),
-                channels=max(int(microphone_info.channels), 1),
-                device_name=str(
-                    dict(session.ai_state.get("audio_observer") or {})
-                    .get("restart_payload", {})
-                    .get("microphone_device_name")
-                    or ""
+        microphone_device_name = str(
+            dict(session.ai_state.get("audio_observer") or {})
+            .get("restart_payload", {})
+            .get("microphone_device_name")
+            or ""
+        )
+        system_device_name = str(
+            dict(session.ai_state.get("audio_observer") or {})
+            .get("restart_payload", {})
+            .get("system_device_name")
+            or dict(session.ai_state.get("audio_observer") or {})
+            .get("restart_payload", {})
+            .get("meeting_output_device_name")
+            or ""
+        )
+        for index, (microphone_path, system_path, microphone_info, system_info) in enumerate(
+            zip(microphone_paths, system_paths, microphone_infos, system_infos),
+            start=1,
+        ):
+            captured_timestamp = max(microphone_path.stat().st_mtime, system_path.stat().st_mtime)
+            captured_at = datetime.fromtimestamp(captured_timestamp, tz=timezone.utc).astimezone().isoformat()
+            session = self._process_full_track_observations(
+                session,
+                microphone_observation=self._build_windows_full_track_observation(
+                    path=microphone_path,
+                    source="microphone",
+                    capture_mode="full_track_microphone",
+                    sample_rate=int(microphone_info.samplerate),
+                    seconds=max(float(microphone_info.duration), 0.0),
+                    channels=max(int(microphone_info.channels), 1),
+                    device_name=microphone_device_name,
+                    captured_at=captured_at,
                 ),
-                captured_at=captured_at,
-            ),
-            system_observation=self._build_windows_full_track_observation(
-                path=system_path,
-                source="system",
-                capture_mode="full_track_system_audio",
-                sample_rate=int(system_info.samplerate),
-                seconds=max(float(system_info.duration), 0.0),
-                channels=max(int(system_info.channels), 1),
-                device_name=str(
-                    dict(session.ai_state.get("audio_observer") or {})
-                    .get("restart_payload", {})
-                    .get("system_device_name")
-                    or dict(session.ai_state.get("audio_observer") or {})
-                    .get("restart_payload", {})
-                    .get("meeting_output_device_name")
-                    or ""
+                system_observation=self._build_windows_full_track_observation(
+                    path=system_path,
+                    source="system",
+                    capture_mode="full_track_system_audio",
+                    sample_rate=int(system_info.samplerate),
+                    seconds=max(float(system_info.duration), 0.0),
+                    channels=max(int(system_info.channels), 1),
+                    device_name=system_device_name,
+                    captured_at=captured_at,
                 ),
-                captured_at=captured_at,
-            ),
+            )
+        archived_full_track = self._sorted_audio_archives(session, archive_key="full_track_archive_paths")
+        chunk_count = len(
+            [
+                item
+                for item in archived_full_track
+                if str(item.get("audio_source") or "").strip().lower() == "microphone"
+            ]
         )
         updated_full_track_state = {
             **dict(session.ai_state.get("full_track_capture") or {}),
             "running": False,
             "strategy": "windows_native_full_track",
-            "chunks": int(dict(session.ai_state.get("full_track_capture") or {}).get("chunks") or 0),
-            "last_archived_at": captured_at,
+            "chunks": chunk_count,
+            "last_archived_at": utcnow_iso(),
             "helper_log_path": str(log_path),
             "manifest_path": str(manifest_path),
             "last_salvaged_at": utcnow_iso(),
@@ -2512,7 +2612,7 @@ class DelegateService:
                 "last_salvaged_at": utcnow_iso(),
                 "last_salvaged_signature": signature,
                 "salvaged_signatures": [*salvaged_signatures[-11:], signature],
-                "last_salvaged_paths": [str(microphone_path), str(system_path)],
+                "last_salvaged_paths": [*(str(path) for path in microphone_paths), *(str(path) for path in system_paths)],
             }
         )
         session.ai_state["audio_observer_recovery"] = recovery_state
@@ -3683,20 +3783,39 @@ class DelegateService:
         rebuilt_chunks: list[TranscriptChunk] = []
         dropped_segment_count = 0
         fallback_reason: str | None = None
-        try:
-            final_result = await asyncio.to_thread(
-                self._ai.transcribe_final_session_audio,
-                microphone_path=merged_audio.get("microphone_path"),
-                meeting_output_path=merged_audio.get("meeting_output_path"),
-            )
-            rebuilt_chunks, dropped_segment_count = self._finalize_offline_audio_chunks(
-                list(final_result.get("chunks") or []),
-                baseline_started_at=str(merged_audio.get("baseline_started_at") or ""),
-            )
-            if not rebuilt_chunks:
-                fallback_reason = "Final merged-track retranscription produced no usable transcript chunks."
-        except Exception as exc:
-            fallback_reason = str(exc).strip() or "Final merged-track retranscription failed."
+        archive_duration_seconds = max(float(merged_audio.get("archive_duration_seconds") or 0.0), 0.0)
+        prefer_chunked_merged_transcription = (
+            archive_duration_seconds >= self._final_merged_transcription_max_seconds
+        )
+        if not prefer_chunked_merged_transcription:
+            try:
+                final_result = await asyncio.to_thread(
+                    self._ai.transcribe_final_session_audio,
+                    microphone_path=merged_audio.get("microphone_path"),
+                    meeting_output_path=merged_audio.get("meeting_output_path"),
+                )
+                rebuilt_chunks, dropped_segment_count = self._finalize_offline_audio_chunks(
+                    list(final_result.get("chunks") or []),
+                    baseline_started_at=str(merged_audio.get("baseline_started_at") or ""),
+                )
+                if not rebuilt_chunks:
+                    fallback_reason = "Final merged-track retranscription produced no usable transcript chunks."
+            except Exception as exc:
+                fallback_reason = str(exc).strip() or "Final merged-track retranscription failed."
+        else:
+            try:
+                final_result = await asyncio.to_thread(
+                    self._transcribe_long_merged_audio_for_final_pass,
+                    merged_audio,
+                )
+                rebuilt_chunks, dropped_segment_count = self._finalize_offline_audio_chunks(
+                    list(final_result.get("chunks") or []),
+                    baseline_started_at=str(merged_audio.get("baseline_started_at") or ""),
+                )
+                if not rebuilt_chunks:
+                    fallback_reason = "Chunked merged-track retranscription produced no usable transcript chunks."
+            except Exception as exc:
+                fallback_reason = str(exc).strip() or "Chunked merged-track retranscription failed."
 
         if not rebuilt_chunks:
             if self._should_attempt_archive_segment_fallback(fallback_reason):
@@ -3805,6 +3924,10 @@ class DelegateService:
         if not system_archives:
             raise RuntimeError("No archived meeting-output track was available for the final transcription quality pass.")
 
+        archive_duration_seconds = max(
+            max(float(item.get("session_end_offset_seconds") or 0.0), 0.0)
+            for item in archives
+        )
         microphone_track = self._compose_final_audio_track(
             session,
             archives=microphone_archives,
@@ -3834,7 +3957,174 @@ class DelegateService:
             "archive_gap_count": int(microphone_track.get("gap_count") or 0) + int(system_track.get("gap_count") or 0),
             "archives": archives,
             "archive_strategy": archive_strategy,
+            "archive_duration_seconds": round(archive_duration_seconds, 3),
         }
+
+    def _transcribe_long_merged_audio_for_final_pass(
+        self,
+        merged_audio: dict[str, Any],
+    ) -> dict[str, Any]:
+        microphone_path = str(merged_audio.get("microphone_path") or "").strip()
+        meeting_output_path = str(merged_audio.get("meeting_output_path") or "").strip()
+        if not microphone_path or not meeting_output_path:
+            raise RuntimeError("Merged final-session audio tracks were unavailable for long-session transcription.")
+
+        prepared_microphone = self._prepare_merged_track_transcription_inputs(Path(microphone_path))
+        prepared_meeting_output = self._prepare_merged_track_transcription_inputs(Path(meeting_output_path))
+        if len(prepared_microphone) != len(prepared_meeting_output):
+            raise RuntimeError("Merged microphone/system chunk counts did not match for long-session transcription.")
+
+        all_chunks: list[TranscriptChunk] = []
+        dropped_segment_count = 0
+        provider = str(self._ai.quality_readiness().get("provider") or "faster_whisper_cuda")
+        model = self._ai.quality_readiness().get("model")
+        compute_type = ""
+        diarization_provider = None
+
+        for microphone_chunk, meeting_output_chunk in zip(prepared_microphone, prepared_meeting_output):
+            offset_seconds = float(microphone_chunk.get("session_offset_seconds") or 0.0)
+            result = self._ai.transcribe_final_session_audio(
+                microphone_path=microphone_chunk.get("path"),
+                meeting_output_path=meeting_output_chunk.get("path"),
+            )
+            shifted = self._offset_final_transcription_chunks(
+                list(result.get("chunks") or []),
+                offset_seconds=offset_seconds,
+            )
+            all_chunks.extend(shifted)
+            dropped_segment_count += int(result.get("dropped_segment_count") or 0)
+            provider = str(result.get("provider") or provider)
+            model = result.get("model") or model
+            compute_type = str(result.get("compute_type") or compute_type)
+            diarization_provider = result.get("diarization_provider") or diarization_provider
+
+        return {
+            "chunks": all_chunks,
+            "provider": provider,
+            "model": model,
+            "compute_type": compute_type,
+            "diarization_provider": diarization_provider,
+            "quality_pass": "final_offline",
+            "dropped_segment_count": dropped_segment_count,
+            "input_strategy": "merged_tracks_chunked",
+        }
+
+    def _prepare_merged_track_transcription_inputs(
+        self,
+        raw_path: str | Path,
+    ) -> list[dict[str, Any]]:
+        path = Path(str(raw_path or "").strip())
+        if not path.exists():
+            return []
+        if importlib.util.find_spec("soundfile") is None:
+            return [
+                {
+                    "path": str(path),
+                    "session_offset_seconds": 0.0,
+                    "seconds": 0.0,
+                }
+            ]
+
+        import soundfile as sf
+
+        info = sf.info(str(path))
+        duration_seconds = max(float(getattr(info, "duration", 0.0) or 0.0), 0.0)
+        if duration_seconds <= self._final_archive_transcription_chunk_seconds:
+            return [
+                {
+                    "path": str(path),
+                    "session_offset_seconds": 0.0,
+                    "seconds": duration_seconds,
+                }
+            ]
+
+        sample_rate = int(getattr(info, "samplerate", 0) or 0)
+        if sample_rate <= 0:
+            return [
+                {
+                    "path": str(path),
+                    "session_offset_seconds": 0.0,
+                    "seconds": duration_seconds,
+                }
+            ]
+
+        max_chunk_frames = max(
+            int(round(self._final_archive_transcription_chunk_seconds * sample_rate)),
+            sample_rate,
+        )
+        prepared: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix="delegate-final-merged-") as temp_dir:
+            temp_root = Path(temp_dir)
+            with sf.SoundFile(str(path), mode="r") as handle:
+                total_frames = int(handle.frames)
+                channels = int(handle.channels)
+                chunk_index = 0
+                start_frame = 0
+                while start_frame < total_frames:
+                    chunk_frames = min(max_chunk_frames, total_frames - start_frame)
+                    handle.seek(start_frame)
+                    audio = handle.read(
+                        frames=chunk_frames,
+                        dtype="float32",
+                        always_2d=channels > 1,
+                    )
+                    if channels == 1 and getattr(audio, "ndim", 1) == 2:
+                        audio = audio[:, 0]
+                    chunk_start_seconds = start_frame / float(sample_rate)
+                    chunk_seconds = chunk_frames / float(sample_rate)
+                    chunk_path = temp_root / f"{path.stem}-part-{chunk_index:04d}.wav"
+                    sf.write(str(chunk_path), audio, sample_rate, format="WAV")
+                    prepared.append(
+                        {
+                            "path": str(chunk_path),
+                            "session_offset_seconds": round(chunk_start_seconds, 3),
+                            "seconds": round(chunk_seconds, 3),
+                        }
+                    )
+                    start_frame += chunk_frames
+                    chunk_index += 1
+            # materialize temp files before context exits
+            stable_dir = Path(tempfile.mkdtemp(prefix="delegate-final-merged-stable-"))
+            stabilized: list[dict[str, Any]] = []
+            for index, item in enumerate(prepared):
+                source = Path(str(item.get("path") or ""))
+                target = stable_dir / f"{path.stem}-part-{index:04d}.wav"
+                shutil.copyfile(source, target)
+                stabilized.append(
+                    {
+                        "path": str(target),
+                        "session_offset_seconds": float(item.get("session_offset_seconds") or 0.0),
+                        "seconds": float(item.get("seconds") or 0.0),
+                    }
+                )
+            return stabilized
+
+    def _offset_final_transcription_chunks(
+        self,
+        chunks: list[TranscriptChunk],
+        *,
+        offset_seconds: float,
+    ) -> list[TranscriptChunk]:
+        if offset_seconds <= 0.0:
+            return chunks
+        shifted: list[TranscriptChunk] = []
+        for chunk in chunks:
+            metadata = dict(chunk.metadata or {})
+            for key in ("start_offset_seconds", "end_offset_seconds", "session_start_offset_seconds", "session_end_offset_seconds"):
+                value = self._metadata_seconds(metadata, key)
+                if value is not None:
+                    metadata[key] = round(value + offset_seconds, 3)
+            shifted.append(
+                TranscriptChunk(
+                    speaker=chunk.speaker,
+                    text=chunk.text,
+                    created_at=chunk.created_at,
+                    source=chunk.source,
+                    direct_question=chunk.direct_question,
+                    metadata=metadata,
+                )
+            )
+        return shifted
 
     def _transcribe_archived_audio_segments_for_final_pass(
         self,
@@ -3849,27 +4139,35 @@ class DelegateService:
         compute_type = ""
         diarization_provider: str | None = None
         pyannote_ready = bool(self.quality_readiness().get("pyannote_ready"))
-
-        for item in archive_items:
-            raw_source = str(item.get("audio_source") or "").strip().lower()
-            raw_path = str(item.get("path") or "").strip()
-            if raw_source not in {"microphone", "system"} or not raw_path:
-                continue
-            session_offset = float(item.get("session_start_offset_seconds") or 0.0)
-            enable_diarization = raw_source == "system" and pyannote_ready and float(item.get("seconds") or 0.0) >= 1.0
-            result = self._ai.transcribe_audio_path_high_quality(
-                input_path=raw_path,
-                fallback_speaker="local_user" if raw_source == "microphone" else "remote_participant",
-                source="microphone_final_offline" if raw_source == "microphone" else "meeting_output_final_offline",
-                channel_origin="local_user" if raw_source == "microphone" else "meeting_output",
-                session_offset_base_seconds=session_offset,
-                quality_pass="final_offline_archive",
-                enable_diarization=enable_diarization,
-            )
-            rebuilt_input.extend(list(result.get("chunks") or []))
-            dropped_segment_count += int(result.get("dropped_segment_count") or 0)
-            compute_type = str(result.get("compute_type") or compute_type)
-            diarization_provider = str(result.get("diarization_provider") or diarization_provider or "") or diarization_provider
+        with tempfile.TemporaryDirectory(prefix="delegate-final-archive-") as temp_dir:
+            temp_root = Path(temp_dir)
+            for item in archive_items:
+                raw_source = str(item.get("audio_source") or "").strip().lower()
+                raw_path = str(item.get("path") or "").strip()
+                if raw_source not in {"microphone", "system"} or not raw_path:
+                    continue
+                session_offset = float(item.get("session_start_offset_seconds") or 0.0)
+                prepared_inputs = self._prepare_archive_item_transcription_inputs(
+                    raw_path=raw_path,
+                    session_offset_seconds=session_offset,
+                    temp_root=temp_root,
+                )
+                for prepared in prepared_inputs:
+                    input_seconds = float(prepared.get("seconds") or 0.0)
+                    enable_diarization = raw_source == "system" and pyannote_ready and input_seconds >= 1.0
+                    result = self._ai.transcribe_audio_path_high_quality(
+                        input_path=str(prepared.get("path") or raw_path),
+                        fallback_speaker="local_user" if raw_source == "microphone" else "remote_participant",
+                        source="microphone_final_offline" if raw_source == "microphone" else "meeting_output_final_offline",
+                        channel_origin="local_user" if raw_source == "microphone" else "meeting_output",
+                        session_offset_base_seconds=float(prepared.get("session_offset_seconds") or session_offset),
+                        quality_pass="final_offline_archive",
+                        enable_diarization=enable_diarization,
+                    )
+                    rebuilt_input.extend(list(result.get("chunks") or []))
+                    dropped_segment_count += int(result.get("dropped_segment_count") or 0)
+                    compute_type = str(result.get("compute_type") or compute_type)
+                    diarization_provider = str(result.get("diarization_provider") or diarization_provider or "") or diarization_provider
 
         rebuilt_chunks, cleanup_dropped = self._finalize_offline_audio_chunks(
             rebuilt_input,
@@ -3885,6 +4183,86 @@ class DelegateService:
             "dropped_segment_count": dropped_segment_count + cleanup_dropped,
             "input_strategy": "archive_segments",
         }
+
+    def _prepare_archive_item_transcription_inputs(
+        self,
+        *,
+        raw_path: str | Path,
+        session_offset_seconds: float,
+        temp_root: Path,
+    ) -> list[dict[str, Any]]:
+        path = Path(str(raw_path or "").strip())
+        if not path.exists():
+            return []
+        if importlib.util.find_spec("soundfile") is None:
+            return [
+                {
+                    "path": str(path),
+                    "session_offset_seconds": max(float(session_offset_seconds), 0.0),
+                    "seconds": 0.0,
+                }
+            ]
+
+        import soundfile as sf
+
+        info = sf.info(str(path))
+        duration_seconds = max(float(getattr(info, "duration", 0.0) or 0.0), 0.0)
+        if duration_seconds <= self._final_archive_transcription_chunk_seconds:
+            return [
+                {
+                    "path": str(path),
+                    "session_offset_seconds": max(float(session_offset_seconds), 0.0),
+                    "seconds": duration_seconds,
+                }
+            ]
+
+        sample_rate = int(getattr(info, "samplerate", 0) or 0)
+        if sample_rate <= 0:
+            return [
+                {
+                    "path": str(path),
+                    "session_offset_seconds": max(float(session_offset_seconds), 0.0),
+                    "seconds": duration_seconds,
+                }
+            ]
+
+        max_chunk_frames = max(
+            int(round(self._final_archive_transcription_chunk_seconds * sample_rate)),
+            sample_rate,
+        )
+        prepared: list[dict[str, Any]] = []
+        with sf.SoundFile(str(path), mode="r") as handle:
+            total_frames = int(handle.frames)
+            channels = int(handle.channels)
+            chunk_index = 0
+            start_frame = 0
+            while start_frame < total_frames:
+                chunk_frames = min(max_chunk_frames, total_frames - start_frame)
+                handle.seek(start_frame)
+                audio = handle.read(
+                    frames=chunk_frames,
+                    dtype="float32",
+                    always_2d=channels > 1,
+                )
+                if channels == 1 and getattr(audio, "ndim", 1) == 2:
+                    audio = audio[:, 0]
+                chunk_start_seconds = start_frame / float(sample_rate)
+                chunk_seconds = chunk_frames / float(sample_rate)
+                chunk_path = temp_root / f"{path.stem}-part-{chunk_index:04d}.wav"
+                sf.write(str(chunk_path), audio, sample_rate, format="WAV")
+                prepared.append(
+                    {
+                        "path": str(chunk_path),
+                        "session_offset_seconds": round(
+                            max(float(session_offset_seconds), 0.0) + chunk_start_seconds,
+                            3,
+                        ),
+                        "seconds": round(chunk_seconds, 3),
+                    }
+                )
+                start_frame += chunk_frames
+                chunk_index += 1
+        return prepared
 
     def _should_attempt_archive_segment_fallback(self, failure_reason: str | None) -> bool:
         normalized = str(failure_reason or "").strip().lower()
@@ -4637,7 +5015,12 @@ class DelegateService:
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         decision = self._reply_decision(session, latest_turn, payload)
-        if not decision["should_reply"]:
+        semantic_tool_check = (
+            latest_turn.role != "bot"
+            and session.delegate_mode in {"answer_on_ask", "approval_required"}
+            and str(decision.get("trigger") or "") == "not_direct"
+        )
+        if not decision["should_reply"] and not semantic_tool_check:
             return {
                 "status": "ignored",
                 "reason": decision["reason"],
@@ -4645,9 +5028,51 @@ class DelegateService:
             }
 
         reply_key = self._reply_key_for_turn(latest_turn, payload)
-        request_text = self._build_reply_request_text(session, latest_turn)
-        draft = await self._ai.draft_reply(session, request_text)
+        metadata = dict(payload.get("metadata") or {})
+        metadata["reply_decision"] = dict(decision)
+        draft = await self._ai.respond_to_live_turn(
+            session,
+            speaker=latest_turn.speaker,
+            text=latest_turn.text,
+            source=latest_turn.source,
+            direct_question=bool(payload.get("direct_question", False)),
+            metadata=metadata,
+        )
+        if draft.get("should_reply") is False:
+            return {
+                "status": "ignored",
+                "reason": str(draft.get("ignore_reason") or decision["reason"]),
+                "trigger": str(decision.get("trigger") or "not_direct"),
+                "provider": str(draft.get("provider") or ""),
+                "response_mode": str(draft.get("response_mode") or "shared_live_core"),
+                "confidence_note": str(draft.get("confidence_note") or ""),
+                "tool_usage_summary": str(draft.get("tool_usage_summary") or ""),
+            }
+        request_text = str(draft.get("request_text") or "").strip()
         draft_text = str(draft.get("draft") or "").strip()
+        if not draft_text:
+            return {
+                "status": "ignored",
+                "reason": "The local AI did not produce a publishable reply.",
+                "trigger": str(decision.get("trigger") or "direct_question"),
+                "provider": str(draft.get("provider") or ""),
+                "response_mode": str(draft.get("response_mode") or "shared_live_core"),
+            }
+        confidence_note = str(draft.get("confidence_note") or "").strip()
+        grounding_summary = str(draft.get("grounding_summary") or "").strip()
+        tool_usage_summary = str(draft.get("tool_usage_summary") or "").strip()
+        provider = str(draft.get("provider") or "codex_exec").strip() or "codex_exec"
+        response_mode = str(draft.get("response_mode") or "shared_live_core").strip() or "shared_live_core"
+        trigger = (
+            str(decision["trigger"])
+            if decision["should_reply"]
+            else str(draft.get("trigger") or "semantic_tool_reply")
+        )
+        reason = (
+            str(decision["reason"])
+            if decision["should_reply"]
+            else "The local AI tool layer decided this live turn should be answered."
+        )
         reply_status = "ready_to_publish"
 
         if session.delegate_mode == "approval_required":
@@ -4670,11 +5095,15 @@ class DelegateService:
                     "reply_id": uuid4().hex[:12],
                     "speaker": latest_turn.speaker,
                     "source": latest_turn.source,
-                    "trigger": decision["trigger"],
+                    "trigger": trigger,
                     "request_text": request_text,
                     "draft": draft_text,
                     "status": reply_status,
-                    "provider": draft.get("provider"),
+                    "provider": provider,
+                    "response_mode": response_mode,
+                    "confidence_note": confidence_note,
+                    "grounding_summary": grounding_summary,
+                    "tool_usage_summary": tool_usage_summary,
                     "created_at": utcnow_iso(),
                 }
             )
@@ -4691,9 +5120,13 @@ class DelegateService:
                     response_expected=False,
                     publish_requested=False,
                     metadata={
-                        "trigger": decision["trigger"],
+                        "trigger": trigger,
                         "reply_status": reply_status,
-                        "provider": draft.get("provider"),
+                        "provider": provider,
+                        "response_mode": response_mode,
+                        "confidence_note": confidence_note,
+                        "grounding_summary": grounding_summary,
+                        "tool_usage_summary": tool_usage_summary,
                         "reply_preview": draft_text,
                     },
                     processed_at=utcnow_iso(),
@@ -4701,10 +5134,14 @@ class DelegateService:
             )
         return {
             "status": reply_status,
-            "trigger": decision["trigger"],
-            "reason": decision["reason"],
+            "trigger": trigger,
+            "reason": reason,
             "draft": draft_text,
-            "provider": draft.get("provider"),
+            "provider": provider,
+            "response_mode": response_mode,
+            "confidence_note": confidence_note,
+            "grounding_summary": grounding_summary,
+            "tool_usage_summary": tool_usage_summary,
             "reply_key": reply_key,
         }
 
@@ -4800,13 +5237,6 @@ class DelegateService:
             if candidate and f"@{candidate}" in normalized_text:
                 return True
         return False
-
-    def _build_reply_request_text(self, session: DelegateSession, turn: ChatTurn) -> str:
-        return (
-            f"Meeting topic: {session.meeting_topic or 'Unknown'}\n"
-            f"Delegate name: {session.bot_display_name}\n"
-            f"Current participant message from {turn.speaker}: {turn.text}\n"
-        )
 
     def _reply_key_for_turn(self, turn: ChatTurn, payload: dict[str, Any]) -> str:
         metadata = dict(payload.get("metadata") or {})

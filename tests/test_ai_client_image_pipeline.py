@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -376,6 +377,72 @@ class AiClientImagePipelineTest(unittest.TestCase):
 
         self.assertIn("--output-schema", command)
         self.assertIn(str(Path("C:/tmp/schema.json")), command)
+
+    def test_normalize_codex_schema_adds_additional_properties_false_recursively(self) -> None:
+        client = AiDelegateClient()
+
+        normalized = client._normalize_codex_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                    "meta": {
+                        "properties": {
+                            "ok": {"type": "boolean"},
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertFalse(normalized["additionalProperties"])
+        self.assertEqual(normalized["required"], ["items", "meta"])
+        self.assertFalse(normalized["properties"]["items"]["items"]["additionalProperties"])
+        self.assertEqual(
+            normalized["properties"]["items"]["items"]["required"],
+            ["title"],
+        )
+        self.assertFalse(normalized["properties"]["meta"]["additionalProperties"])
+        self.assertEqual(normalized["properties"]["meta"]["required"], ["ok"])
+
+    def test_extract_codex_error_message_prefers_structured_stdout_error(self) -> None:
+        client = AiDelegateClient()
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "code": "invalid_json_schema",
+                                    "message": "Nested objects must set additionalProperties=false.",
+                                },
+                            }
+                        ),
+                    }
+                ),
+            ]
+        )
+
+        message = client._extract_codex_error_message(stdout, "very noisy stderr")
+
+        self.assertEqual(
+            message,
+            "invalid_json_schema: Nested objects must set additionalProperties=false.",
+        )
 
     def test_generate_result_images_prefers_direct_mcp_route(self) -> None:
         client = AiDelegateClient()
